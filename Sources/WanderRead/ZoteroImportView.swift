@@ -9,12 +9,14 @@ struct ZoteroImportView: View {
     @State private var pdfOnly = false
     @State private var busy = false
     @State private var problem: String?
+    @State private var previousFolderUnavailable = false
     @State private var loadID = UUID()
     private var selection: [ReadingItem] { snapshot?.selection(folder: folder, pdfOnly: pdfOnly) ?? [] }
     private var fresh: [ReadingItem] {
         let existing = Set(store.library.items.map { Targets.key($0.target) })
         return selection.filter { !existing.contains(Targets.key($0.target)) }
     }
+    private var scopeName: String { snapshot?.folders.first { $0.id == folder }?.path ?? "整个个人库" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -46,7 +48,11 @@ struct ZoteroImportView: View {
                     }
                     Toggle("仅带 PDF", isOn: $pdfOnly).toggleStyle(.checkbox).fixedSize()
                 }
-                Text("将收录 \(fresh.count) 篇，跳过 \(selection.count - fresh.count) 篇已有文献。选分类时包含它的子分类。")
+                if previousFolderUnavailable {
+                    Text("上次的分类已不可用，请核对当前收录范围。")
+                        .font(.system(size: 12)).foregroundColor(Palette.muted)
+                }
+                Text("\(scopeName) · 新增 \(fresh.count) 篇 · 跳过 \(selection.count - fresh.count) 篇已有文献")
                     .font(.system(size: 12, weight: .medium)).foregroundColor(Palette.green)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
@@ -76,8 +82,8 @@ struct ZoteroImportView: View {
                 Spacer()
                 if snapshot != nil {
                     Button("收录 \(fresh.count) 篇") {
-                        let name = snapshot?.folders.first { $0.id == folder }?.path ?? "个人库"
-                        if store.mergeItems(selection, label: "Zotero · " + name) { dismiss() }
+                        let scope = ZoteroImportScope(folder: folder, pdfOnly: pdfOnly)
+                        if store.mergeItems(selection, label: "Zotero · " + scopeName, zoteroScope: scope) { dismiss() }
                     }.buttonStyle(ActionStyle(primary: true)).disabled(fresh.isEmpty || busy).keyboardShortcut(.defaultAction)
                 }
             }
@@ -88,11 +94,21 @@ struct ZoteroImportView: View {
                     let result = try await ZoteroAPI.snapshot()
                     try Task.checkCancellation()
                     snapshot = result
+                    if let previous = store.library.preferences.lastZoteroImport {
+                        pdfOnly = previous.pdfOnly
+                        if let key = previous.folder {
+                            previousFolderUnavailable = !result.folders.contains { $0.id == key }
+                            folder = previousFolderUnavailable ? nil : key
+                        }
+                    }
                 } catch {
                     guard !Task.isCancelled else { return }
                     problem = error.localizedDescription
                 }
                 busy = false
+            }
+            .onChange(of: folder) { value in
+                if value != nil { previousFolderUnavailable = false }
             }
     }
 }

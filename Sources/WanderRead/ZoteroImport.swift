@@ -1,15 +1,48 @@
 import Foundation
 
+struct ZoteroImportScope: Codable {
+    var folder: String?
+    var pdfOnly: Bool
+}
+
 struct ZoteroReference: Codable, Equatable {
     var itemKey: String
     var pdfKey: String?
     var localPDF: String?
+    var citationKey: String?
     var localURL: URL? {
         guard let localPDF, localPDF.hasPrefix("/") else { return nil }
         let url = URL(fileURLWithPath: localPDF)
         guard url.pathExtension.lowercased() == "pdf", FileManager.default.isReadableFile(atPath: url.path),
               (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { return nil }
         return url
+    }
+}
+
+enum CitationKey {
+    static func normalized(_ raw: String?) -> String? {
+        guard var key = raw?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        if key.hasPrefix("@") { key.removeFirst() }
+        let lettersAndNumbers = CharacterSet.alphanumerics
+        let allowed = lettersAndNumbers.union(CharacterSet(charactersIn: "_:.#$%&-+?<>~/"))
+        guard !key.isEmpty, key.utf8.count <= 240, key.unicodeScalars.contains(where: lettersAndNumbers.contains),
+              key.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return key
+    }
+
+    static func markdown(_ key: String, locator: String? = nil) -> String {
+        let bareKey = #"\A[\p{L}\p{N}\p{M}_]+(?:[:.#$%&+?<>~/-][\p{L}\p{N}\p{M}_]+)*\z"#
+        let identifier = key.range(of: bareKey, options: .regularExpression) == nil ? "{\(key)}" : key
+        return "[@\(identifier)" + (locator.map { ", " + $0 } ?? "") + "]"
+    }
+
+    static func fromExtra(_ extra: String?) -> String? {
+        for line in extra?.split(whereSeparator: \.isNewline) ?? [] {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "citation key",
+               let key = normalized(String(parts[1])) { return key }
+        }
+        return nil
     }
 }
 
@@ -42,6 +75,12 @@ struct ZoteroRow: Decodable {
         var tags: [Tag]?
         var collections: [String]?
         var creators: [Creator]?
+        var citationKey: String?
+        var extra: String?
+
+        var exportKey: String? {
+            CitationKey.normalized(citationKey) ?? CitationKey.fromExtra(extra)
+        }
     }
     struct Tag: Decodable { var tag: String }
     struct Creator: Decodable { var name: String?; var firstName: String?; var lastName: String? }
@@ -95,7 +134,7 @@ struct ZoteroSnapshot {
                 .filter { !$0.isEmpty && tags.insert($0).inserted }.prefix(24))
             var item = ReadingItem(title: title, target: "zotero://select/library/items/\(row.key)", note: detail,
                                    tags: topics.isEmpty ? ["Zotero"] : topics)
-            item.zotero = ZoteroReference(itemKey: row.key, pdfKey: best)
+            item.zotero = ZoteroReference(itemKey: row.key, pdfKey: best, citationKey: row.pdf ? nil : row.data.exportKey)
             return (item, Set(keys.flatMap(ancestry)))
         }
     }
@@ -131,9 +170,9 @@ enum ZoteroAPI {
         return try await ZoteroSnapshot(collections: folders, rows: rows, attachments: attachments)
     }
 
-    static func pdfURL(_ key: String) async throws -> URL {
+    static func pdfURL(_ key: String, timeout: TimeInterval = 8) async throws -> URL {
         guard validKey(key) else { throw InputError.invalid("Zotero 附件标识无效。") }
-        let (data, _) = try await get("items/\(key)/file/view/url")
+        let (data, _) = try await get("items/\(key)/file/view/url", timeout: timeout)
         guard let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               let url = URL(string: path), url.isFileURL, url.host?.isEmpty != false || url.host == "localhost",
               url.pathExtension.lowercased() == "pdf", FileManager.default.isReadableFile(atPath: url.path),
@@ -141,6 +180,68 @@ enum ZoteroAPI {
             throw InputError.invalid("这份 PDF 附件还没在本机就绪。可在 Zotero 下载或修复附件，再回漫读打开。")
         }
         return url.standardizedFileURL
+    }
+
+    static func citationLookup(_ item: ReadingItem) -> String? {
+        if let key = item.zotero?.itemKey, validKey(key) { return key }
+        let url = item.target.hasPrefix("/") ? URL(fileURLWithPath: item.target) : URL(string: item.target)
+        guard let url else { return nil }
+        if url.scheme == "zotero", ["select", "open-pdf"].contains(url.host ?? "") {
+            let parts = url.path.split(separator: "/")
+            if parts.count == 3, parts[0] == "library", parts[1] == "items", validKey(String(parts[2])) {
+                return String(parts[2])
+            }
+        }
+        if let folder = storageFolder(for: url), validKey(folder.lastPathComponent) { return folder.lastPathComponent }
+        return nil
+    }
+
+    static func citationKey(for item: ReadingItem) async -> String? {
+        guard let key = citationLookup(item) else { return nil }
+        if item.zotero == nil {
+            let target = item.target.hasPrefix("/") ? URL(fileURLWithPath: item.target) : URL(string: item.target)
+            if let target, target.isFileURL {
+                guard let attachment = try? await pdfURL(key, timeout: 2),
+                      attachment.resolvingSymlinksInPath().path == target.resolvingSymlinksInPath().path else { return nil }
+            }
+        }
+        guard let row = try? await citationRow(key) else { return nil }
+        if row.data.itemType != "attachment" { return await exportKey(row) }
+        guard let parent = row.data.parentItem, let record = try? await citationRow(parent),
+              record.data.itemType != "attachment" else { return nil }
+        return await exportKey(record)
+    }
+
+    private static func storageFolder(for url: URL) -> URL? {
+        guard url.isFileURL, url.pathExtension.lowercased() == "pdf" else { return nil }
+        let folder = url.deletingLastPathComponent()
+        return folder.deletingLastPathComponent().lastPathComponent == "storage" ? folder : nil
+    }
+
+    private static func citationRow(_ key: String) async throws -> ZoteroRow {
+        guard validKey(key) else { throw InputError.invalid("Zotero 文献标识无效。") }
+        let (bytes, _) = try await get("items/\(key)", timeout: 2)
+        let row = try JSONDecoder().decode(ZoteroRow.self, from: bytes)
+        guard row.key == key else { throw InputError.invalid("Zotero 返回的文献与所选条目不一致。") }
+        return row
+    }
+
+    private static func exportKey(_ row: ZoteroRow) async -> String? {
+        guard !["note", "annotation"].contains(row.data.itemType) else { return nil }
+        if let key = row.data.exportKey { return key }
+        struct Response: Decodable { let result: [String: String?]? }
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:23119/better-bibtex/json-rpc")!, timeoutInterval: 2)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "jsonrpc": "2.0", "method": "item.citationkey", "id": 1, "params": [[row.key]]
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let keys = try? JSONDecoder().decode(Response.self, from: data).result,
+              let key = keys[row.key] ?? nil else { return nil }
+        return CitationKey.normalized(key)
     }
 
     private static func pages<T: Decodable>(_ route: String, query: [URLQueryItem] = []) async throws -> [T] {
@@ -164,7 +265,7 @@ enum ZoteroAPI {
         }
     }
 
-    private static func get(_ route: String, query: [URLQueryItem] = []) async throws -> (Data, HTTPURLResponse) {
+    private static func get(_ route: String, query: [URLQueryItem] = [], timeout: TimeInterval = 8) async throws -> (Data, HTTPURLResponse) {
         var components = URLComponents()
         components.scheme = "http"
         components.host = "127.0.0.1"
@@ -172,7 +273,7 @@ enum ZoteroAPI {
         components.path = "/api/users/0/" + route
         if !query.isEmpty { components.queryItems = query }
         guard let url = components.url else { throw InputError.invalid("Zotero 入口无效。") }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("3", forHTTPHeaderField: "Zotero-API-Version")
         request.setValue("WanderRead", forHTTPHeaderField: "User-Agent")
         do {

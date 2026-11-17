@@ -27,7 +27,7 @@ struct PDFReadingLine: Codable, Equatable {
     var rect: CGRect
 }
 
-enum PDFMarkColor: String, Codable, CaseIterable {
+enum ReadingMarkColor: String, Codable, CaseIterable {
     case yellow, green, blue, pink
 
     var title: String {
@@ -47,6 +47,26 @@ enum PDFMarkColor: String, Codable, CaseIterable {
         case .pink: return .systemPink
         }
     }
+
+    func underlineColor(onDark: Bool) -> NSColor {
+        onDark ? color : (color.blended(withFraction: 0.29, of: .black) ?? color)
+    }
+}
+
+enum ReadingMarkStyle: String, Codable, CaseIterable {
+    case highlight, underline
+
+    var title: String {
+        switch self {
+        case .highlight: return "高亮"
+        case .underline: return "下划线"
+        }
+    }
+}
+
+struct ReadingMarkAppearance: Codable, Equatable {
+    var color: ReadingMarkColor = .yellow
+    var style: ReadingMarkStyle = .highlight
 }
 
 struct PDFReadingMark: Codable, Equatable, Identifiable {
@@ -60,10 +80,23 @@ struct PDFReadingMark: Codable, Equatable, Identifiable {
     var quote: String
     var note: String
     var createdAt = Date()
-    var color: PDFMarkColor?
+    var color: ReadingMarkColor?
     var isExcerpt: Bool?
     var scan: PDFScanClip?
     var printedPage: String?
+    var printedPageEnd: String?
+    var style: ReadingMarkStyle?
+    var quoteCorrection: PDFQuoteCorrection?
+
+    var needsQuoteReview: Bool { quoteCorrection == nil && PDFQuoteQuality.isSuspicious(quote) }
+
+    var appearance: ReadingMarkAppearance {
+        get { ReadingMarkAppearance(color: color ?? .yellow, style: style ?? .highlight) }
+        set {
+            color = newValue.color
+            style = newValue.style
+        }
+    }
 }
 
 struct PDFReadingState: Codable, Equatable {
@@ -71,6 +104,9 @@ struct PDFReadingState: Codable, Equatable {
     var marks: [PDFReadingMark] = []
     var outline: PDFSavedOutline?
     var foldCorrections: PDFSavedFoldCorrections?
+    var detectedOutline: PDFDetectedOutline?
+    var foldOptions: PDFFoldOptions?
+    var bookmarks: [PDFPlaceBookmark]?
 }
 
 struct PDFReadingSection: Identifiable, Codable, Equatable {
@@ -85,6 +121,21 @@ struct PDFSavedOutline: Codable, Equatable {
     let revision: String
     let sections: [PDFReadingSection]
     var draft: [PDFOutlineCandidate]?
+}
+
+struct PDFDetectedOutline: Codable, Equatable {
+    static let currentVersion = 3
+    var version = Self.currentVersion
+    let revision: String
+    let entries: [PDFOutlineCandidate]
+}
+
+struct PDFPlaceBookmark: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var title: String
+    let revision: String
+    let location: PDFReadingLocation
+    let foldPosition: PDFFoldPosition?
 }
 
 final class PDFReader: ObservableObject {
@@ -104,10 +155,35 @@ final class PDFReader: ObservableObject {
     @Published private(set) var marks: [PDFReadingMark]
     @Published private(set) var savedOutline: [PDFReadingSection]
     private(set) var outlineDraft: [PDFOutlineCandidate]?
+    @Published private(set) var detectedOutline: [PDFOutlineCandidate]?
+    private var automaticSections: [PDFReadingSection] = []
+    @Published private(set) var findingOutline = false
+    @Published private(set) var outlineFileChanged = false
+    @Published private(set) var foldOptions: PDFFoldOptions
+    @Published private(set) var bookmarks: [PDFPlaceBookmark]
     @Published private(set) var foldCorrections: [PDFFoldCorrection]
     @Published private(set) var location: PDFReadingLocation
     @Published private(set) var hasSelection = false
+    @Published var selectionAnchor: CGRect?
     var selectedQuote: String? { canvas?.currentSelection?.string }
+    var translationDocument: TranslationDocument { TranslationDocument(itemID: itemID, revision: revision) }
+    var translationSource: PDFTranslationSource {
+        PDFTranslationSource(document: translationDocument, url: url, pageCount: document.pageCount)
+    }
+
+    var translationSelection: TranslationPassage? {
+        guard !showOutline, !selectingRegion, let selection = canvas?.currentSelection,
+              let text = selection.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let pages = selection.pages.map { document.index(for: $0) }.filter { (0..<document.pageCount).contains($0) }
+        let first = pages.min() ?? location.page
+        let last = pages.max() ?? first
+        let place = first == last ? pageReference(first) : "PDF 第 \(first + 1)–\(last + 1) 页"
+        return TranslationPassage(text: text, title: title, place: place, document: translationDocument,
+                                  suspectedEncodingError: PDFQuoteQuality.isSuspicious(text))
+    }
+    var defaultMarkAppearance: ReadingMarkAppearance {
+        store?.library.preferences.readingMarkAppearance ?? ReadingMarkAppearance()
+    }
     @Published private(set) var canUndo = false
     @Published private(set) var previousVersion: Bool
     @Published var noteDraft: PDFReadingMark?
@@ -117,7 +193,12 @@ final class PDFReader: ObservableObject {
     @Published var showOutline = false {
         didSet {
             guard showOutline != oldValue else { return }
-            if !showOutline { restoreCanvasPosition() }
+            foldReflow = nil
+            if showOutline {
+                clearSelection()
+            } else {
+                restoreCanvasPosition()
+            }
             schedulePositionSave()
         }
     }
@@ -130,8 +211,17 @@ final class PDFReader: ObservableObject {
     private var undoMarks: [[PDFReadingMark]] = []
     private var saveWork: DispatchWorkItem?
     private var restoring = false
+    private var layoutRestore: DispatchWorkItem?
     private var needsPositionSave = false
     private var contextualLocation: PDFReadingLocation?
+    private var programmaticViewport: PDFReadingLocation?
+    private var foldReflow: FoldReflow?
+    private var outlineWork: Task<Void, Never>?
+
+    private struct FoldReflow {
+        let destination: PDFFoldPosition
+        let returnLocation: PDFReadingLocation?
+    }
 
     init(item: ReadingItem, url: URL, revision: String, document: PDFDocument, store: ReadingStore,
          markID: UUID? = nil, requestedLocation: PDFReadingLocation? = nil) {
@@ -144,12 +234,25 @@ final class PDFReader: ObservableObject {
         self.store = store
         let storedMarks = item.pdfReading?.marks ?? []
         marks = storedMarks
+        let savedSections: [PDFReadingSection]
         if let saved = item.pdfReading?.outline, saved.revision == revision {
-            savedOutline = saved.sections.filter { (0..<document.pageCount).contains($0.location.page) }
+            savedSections = saved.sections.filter { (0..<document.pageCount).contains($0.location.page) }
             outlineDraft = saved.draft
         } else {
-            savedOutline = []
+            savedSections = []
         }
+        savedOutline = savedSections
+        if let cache = item.pdfReading?.detectedOutline, cache.revision == revision,
+           cache.version == PDFDetectedOutline.currentVersion {
+            detectedOutline = cache.entries
+            automaticSections = Self.readableSections(cache.entries, pageCount: document.pageCount)
+        }
+        let defaults = store.library.preferences
+        foldOptions = item.pdfReading?.foldOptions ?? PDFFoldOptions(
+            unit: savedSections.isEmpty ? (defaults.pdfFoldUnit ?? .chapter) : .chapter,
+            pages: defaults.pdfFoldPages ?? 3
+        )
+        bookmarks = item.pdfReading?.bookmarks ?? []
         let corrections = item.pdfReading?.foldCorrections
         foldCorrections = corrections?.revision == revision ? corrections?.edits ?? [] : []
         revealedNote = storedMarks.first(where: { $0.id == markID })?.id
@@ -172,6 +275,8 @@ final class PDFReader: ObservableObject {
         } : outline
         showOutline = markID == nil && requestedLocation == nil && saved?.isFolded == true
     }
+
+    deinit { outlineWork?.cancel() }
 
     static func fingerprint(_ url: URL) throws -> String {
         let file = try FileHandle(forReadingFrom: url)
@@ -239,11 +344,27 @@ final class PDFReader: ObservableObject {
         guard canvas === view else { return }
         view.layoutDocumentView()
         moveCanvas(to: location)
+        programmaticViewport = viewport(in: view)
         restoring = false
         view.documentView?.needsDisplay = true
         view.needsDisplay = true
     }
 
+    func preserveCanvasReadingPosition(in view: PDFView) {
+        guard canvas === view, !showOutline else { return }
+        layoutRestore?.cancel()
+        restoring = true
+        let work = DispatchWorkItem { [weak self, weak view] in
+            guard let self else { return }
+            self.restoring = false
+            self.layoutRestore = nil
+            guard let view, self.canvas === view, !self.showOutline else { return }
+            view.layoutDocumentView()
+            self.restoreCanvasPosition()
+        }
+        layoutRestore = work
+        DispatchQueue.main.async(execute: work)
+    }
     private static func validPoint(_ point: CGPoint) -> CGPoint? {
         guard point.x.isFinite, point.y.isFinite, point.x != kPDFDestinationUnspecifiedValue,
               point.y != kPDFDestinationUnspecifiedValue else { return nil }
@@ -251,29 +372,60 @@ final class PDFReader: ObservableObject {
     }
 
     func selectionChanged() {
-        hasSelection = canvas?.currentSelection?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let selected = selectedQuote?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if selected != hasSelection { hasSelection = selected }
+    }
+
+    func clearSelection() {
+        canvas?.clearSelection()
+        selectionChanged()
+        if selectionAnchor != nil { selectionAnchor = nil }
+    }
+
+    func readingAidOrigin() -> PDFReadingLocation {
+        guard let view = canvas else { return location }
+        if let selection = view.currentSelection,
+           let page = selection.pages.first(where: { page in view.visiblePages.contains(page) }),
+           let line = selection.selectionsByLine().first(where: { !$0.bounds(for: page).isEmpty }) {
+            let rect = line.bounds(for: page)
+            return PDFReadingLocation(page: document.index(for: page), point: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        let sample = CGPoint(x: view.bounds.midX, y: view.bounds.maxY - min(72, view.bounds.height / 5))
+        guard let page = document.page(at: location.page) ?? view.page(for: sample, nearest: true) else { return location }
+        let point = view.convert(sample, to: page)
+        let bounds = page.bounds(for: view.displayBox)
+        if let anchor = location.point, anchor.x > bounds.minX + bounds.width * 0.07 { return location }
+        let readingX = bounds.minX + bounds.width * 0.28
+        let readingY = min(bounds.maxY, max(bounds.minY, point.y))
+        return PDFReadingLocation(page: document.index(for: page), point: Self.validPoint(CGPoint(x: readingX, y: readingY)))
     }
 
     func visiblePositionChanged() {
-        guard !showOutline, !restoring, let view = canvas, let page = view.currentPage else { return }
+        guard !showOutline, !restoring, let view = canvas, let next = viewport(in: view) else { return }
+        if let initial = programmaticViewport, next.page == initial.page {
+            // PDFKit can fit both columns and report the left edge after a jump to the right column.
+            if next == initial { return }
+            if let point = next.point, let origin = initial.point,
+               abs(point.x - origin.x) <= 12 && abs(point.y - origin.y) <= 12 { return }
+        }
+        programmaticViewport = nil
+        guard next != location else { return }
+        location = next
+        foldPosition = nil
+        schedulePositionSave()
+    }
+
+    private func viewport(in view: PDFView) -> PDFReadingLocation? {
+        guard let page = view.currentPage else { return nil }
         let index = document.index(for: page)
-        guard index < document.pageCount else { return }
+        guard (0..<document.pageCount).contains(index) else { return nil }
         let bounds = page.bounds(for: view.displayBox)
         let point = view.currentDestination.flatMap { destination -> CGPoint? in
             guard destination.page === page, let point = Self.validPoint(destination.point) else { return nil }
             return CGPoint(x: min(bounds.maxX, max(bounds.minX, point.x)),
                            y: min(bounds.maxY, max(bounds.minY, point.y)))
         }
-        let next = PDFReadingLocation(page: index, point: point)
-        if foldPosition?.page == index, let y = point?.y,
-           abs(y - (location.point?.y ?? bounds.maxY)) <= 16 {
-            // PDFKit can adjust a destination to fit the page margin or current zoom.
-            return
-        }
-        guard next != location else { return }
-        location = next
-        foldPosition = nil
-        schedulePositionSave()
+        return PDFReadingLocation(page: index, point: point)
     }
 
     private func moveCanvas(to target: PDFReadingLocation) {
@@ -306,15 +458,41 @@ final class PDFReader: ObservableObject {
         schedulePositionSave()
     }
 
+    func jumpInFold(to target: PDFReadingLocation, position: PDFFoldPosition?, preserveReflow: Bool = false) {
+        guard showOutline, (0..<document.pageCount).contains(target.page) else { return }
+        if !preserveReflow { foldReflow = nil }
+        location = target
+        foldPosition = position?.page == target.page ? position : nil
+        schedulePositionSave()
+    }
+
+    func prepareFoldReflow(to destination: PDFFoldPosition, returnLocation: PDFReadingLocation?) {
+        foldReflow = FoldReflow(destination: destination, returnLocation: returnLocation)
+    }
+
+    func originalLocationForFoldReflow() -> PDFReadingLocation? {
+        foldReflow?.returnLocation
+    }
+
+    var foldReflowTarget: PDFFoldPosition? { foldReflow?.destination }
+
     func restoreCanvasPosition() {
         let wasRestoring = restoring
         restoring = true
         moveCanvas(to: location)
+        programmaticViewport = canvas.flatMap(viewport(in:))
         restoring = wasRestoring
     }
 
     func rememberFoldPosition(_ position: PDFFoldPosition, passage: FoldedPDFPassage? = nil) {
         guard showOutline, (0..<document.pageCount).contains(position.page), foldPosition != position else { return }
+        if let reflow = foldReflow {
+            let staysOnPassage = position == reflow.destination || passage?.sources(startingOn: position.page).contains { source in
+                source.page == reflow.destination.page &&
+                    (reflow.destination.offset.map { NSLocationInRange($0, source.range) } ?? true)
+            } == true
+            if !staysOnPassage { foldReflow = nil }
+        }
         var anchor = PDFReadingLocation(page: position.page)
         if let passage, let page = sourcePage(at: position.page),
            let line = page.textSelection(in: passage.range)?.selectionsByLine().first {
@@ -341,24 +519,135 @@ final class PDFReader: ObservableObject {
     }
 
     func outlineEntryAtSelection() -> (title: String, location: PDFReadingLocation) {
-        guard let line = canvas?.currentSelection?.selectionsByLine().first,
-              let page = line.pages.first, let text = line.string else { return ("", location) }
+        guard let selection = canvas?.currentSelection, let page = selection.pages.first,
+              let firstLine = selection.selectionsByLine().first, let text = selection.string else { return ("", location) }
         let index = document.index(for: page)
-        let rect = line.bounds(for: page)
+        let rect = firstLine.bounds(for: page)
         guard (0..<document.pageCount).contains(index), !rect.isEmpty else { return ("", location) }
-        return (String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)),
+        return (String(ChineseReading.reflow(text).prefix(200)),
                 PDFReadingLocation(page: index, point: CGPoint(x: rect.minX, y: rect.maxY)))
+    }
+
+    private static func readableSections(_ entries: [PDFOutlineCandidate], pageCount: Int) -> [PDFReadingSection] {
+        PDFOutlineCandidate.sections(from: entries.filter { !$0.isPending }, pageCount: pageCount) ?? []
+    }
+
+    var navigationSections: [PDFReadingSection] {
+        if !savedOutline.isEmpty { return savedOutline }
+        if hasAuthorOutline { return sections }
+        return automaticSections
+    }
+
+    var outlineForEditing: [PDFOutlineCandidate] {
+        if let outlineDraft { return outlineDraft }
+        if savedOutline.isEmpty && !hasAuthorOutline { return detectedOutline ?? [] }
+        let current = savedOutline.isEmpty ? sections : savedOutline
+        return current.map {
+            PDFOutlineCandidate(title: $0.title, depth: $0.depth, location: $0.location, printedLabel: $0.printedLabel)
+        }
+    }
+
+    var pendingOutlineCount: Int {
+        (outlineDraft ?? (savedOutline.isEmpty ? detectedOutline : nil))?.filter(\.isPending).count ?? 0
+    }
+
+    func prepareOutline() {
+        guard !hasAuthorOutline, savedOutline.isEmpty, detectedOutline == nil,
+              outlineWork == nil, !outlineFileChanged else { return }
+        let url = self.url
+        let revision = self.revision
+        findingOutline = true
+        let worker = Task.detached(priority: .utility) { Self.detectOutline(at: url, revision: revision) }
+        outlineWork = Task { @MainActor [weak self] in
+            let entries = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+            guard let self, !Task.isCancelled else { return }
+            self.outlineWork = nil
+            if let entries { self.cacheOutline(entries) }
+            else { self.outlineFileChanged = true }
+            self.findingOutline = false
+        }
+    }
+
+    func stopOutlineDetection() {
+        outlineWork?.cancel()
+        outlineWork = nil
+        findingOutline = false
+    }
+
+    static func detectOutline(at url: URL, revision: String, scanRange: Range<Int>? = nil) -> [PDFOutlineCandidate]? {
+        let entries = PDFOutlineBuilder.generate(at: url, scanRange: scanRange, autoScan: true)
+        guard !Task.isCancelled, (try? fingerprint(url)) == revision else { return nil }
+        return entries
+    }
+
+    private func cacheOutline(_ entries: [PDFOutlineCandidate]) {
+        let cache = PDFDetectedOutline(revision: revision, entries: entries)
+        _ = store?.updatePDFReading(itemID, reportError: false) { $0.detectedOutline = cache }
+        automaticSections = Self.readableSections(entries, pageCount: document.pageCount)
+        detectedOutline = entries
     }
 
     func saveOutline(_ entries: [PDFOutlineCandidate], resolvedOnly: Bool = false) -> Bool {
         let resolved = resolvedOnly ? entries.filter { !$0.isPending } : entries
-        guard !hasAuthorOutline, let store,
+        guard let store,
               let sections = PDFOutlineCandidate.sections(from: resolved, pageCount: document.pageCount) else { return false }
         let draft = entries.count == resolved.count ? nil : entries
         let outline = PDFSavedOutline(revision: revision, sections: sections, draft: draft)
         guard store.updatePDFReading(itemID, { $0.outline = outline }) else { return false }
         outlineDraft = draft
         savedOutline = sections
+        return true
+    }
+
+    func restoreAuthorOutline() -> Bool {
+        guard hasAuthorOutline, !savedOutline.isEmpty,
+              store?.updatePDFReading(itemID, { $0.outline = nil }) == true else { return false }
+        outlineDraft = nil
+        savedOutline = []
+        return true
+    }
+
+    @discardableResult func setFoldOptions(_ options: PDFFoldOptions) -> Bool {
+        guard options != foldOptions else { return true }
+        guard store?.updatePDFReading(itemID, { $0.foldOptions = options }) == true else { return false }
+        foldOptions = options
+        return true
+    }
+
+    var bookmarkHere: PDFPlaceBookmark? {
+        bookmarks.last { bookmark in
+            guard bookmark.revision == revision, bookmark.location.page == location.page else { return false }
+            if let saved = bookmark.foldPosition, showOutline, saved == foldPosition { return true }
+            switch (bookmark.location.point, location.point) {
+            case (nil, nil): return true
+            case (let first?, let second?): return abs(first.x - second.x) <= 12 && abs(first.y - second.y) <= 12
+            default: return false
+            }
+        }
+    }
+
+    @discardableResult func toggleBookmark(title: String) -> Bool {
+        if let bookmarkHere { return removeBookmark(bookmarkHere.id) }
+        let mark = PDFPlaceBookmark(title: title, revision: revision, location: location,
+                                    foldPosition: showOutline ? foldPosition : nil)
+        return saveBookmarks(bookmarks + [mark])
+    }
+
+    @discardableResult func renameBookmark(_ id: UUID, title: String) -> Bool {
+        let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+        guard !title.isEmpty, let index = bookmarks.firstIndex(where: { $0.id == id }) else { return false }
+        var next = bookmarks
+        next[index].title = title
+        return saveBookmarks(next)
+    }
+
+    @discardableResult func removeBookmark(_ id: UUID) -> Bool {
+        saveBookmarks(bookmarks.filter { $0.id != id })
+    }
+
+    private func saveBookmarks(_ next: [PDFPlaceBookmark]) -> Bool {
+        guard store?.updatePDFReading(itemID, { $0.bookmarks = next }) == true else { return false }
+        bookmarks = next
         return true
     }
 
@@ -408,11 +697,17 @@ final class PDFReader: ObservableObject {
             if kind == .annotation { throw InputError.invalid("先在原页选中一句，就能划线或写批注。") }
             return PDFReadingMark(kind: kind, revision: revision, location: location, lines: [], quote: "", note: "")
         }
-        return try draft(kind: kind, selection: selection, text: text, in: document)
+        return try draft(kind: kind, selection: selection, in: document)
     }
 
-    private func draft(kind: PDFReadingMark.Kind, selection: PDFSelection, text: String, in document: PDFDocument) throws -> PDFReadingMark {
-        try draft(kind: kind, lines: readingLines(in: selection, document: document), text: text)
+    func draft(kind: PDFReadingMark.Kind, selection: PDFSelection, in original: PDFDocument) throws -> PDFReadingMark {
+        guard original.pageCount == document.pageCount, !selection.pages.isEmpty,
+              selection.pages.allSatisfy({ (0..<original.pageCount).contains(original.index(for: $0)) }),
+              let text = selection.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw InputError.invalid("请在原文栏重新选取文字。")
+        }
+        let candidate = try draft(kind: kind, lines: readingLines(in: selection, document: original), text: text)
+        return preparedMark(candidate)
     }
 
     private func readingLines(in selection: PDFSelection, document: PDFDocument) -> [PDFReadingLine] {
@@ -440,30 +735,46 @@ final class PDFReader: ObservableObject {
         return PDFReadingMark(kind: kind, revision: revision, location: origin, lines: lines, quote: text, note: "")
     }
 
-    func excerpt(_ passage: FoldedPDFPassage? = nil, page: Int? = nil) throws -> PDFReadingMark? {
-        var mark: PDFReadingMark
-        if let passage, let page {
-            let lines = sourceLines(of: passage, page: page)
-            if let draft = try? draft(kind: .annotation, lines: lines, text: passage.text) {
-                mark = draft
-            } else {
-                mark = PDFReadingMark(kind: .annotation, revision: revision, location: location(of: passage, on: page),
-                                      lines: [], quote: passage.text, note: "")
-            }
-        } else {
-            mark = try draft(kind: .annotation)
-        }
+    private func preparedMark(_ candidate: PDFReadingMark) -> PDFReadingMark {
+        guard candidate.kind == .annotation, !candidate.quote.isEmpty else { return candidate }
         if let existing = marks.last(where: {
-            $0.isExcerpt == true && $0.revision == mark.revision && $0.location == mark.location && $0.quote == mark.quote
+            $0.kind == .annotation && $0.scan == nil && $0.revision == candidate.revision
+                && $0.location == candidate.location && $0.lines == candidate.lines
+                && ($0.quote == candidate.quote || $0.quoteCorrection?.original == candidate.quote)
         }) { return existing }
-        mark.isExcerpt = true
-        return save(mark) ? mark : nil
+        var mark = candidate
+        if let appearance = store?.library.preferences.readingMarkAppearance { mark.appearance = appearance }
+        return mark
     }
 
-    @discardableResult func save(_ mark: PDFReadingMark) -> Bool {
+    func excerpt(_ passage: FoldedPDFPassage? = nil, page: Int? = nil,
+                 appearance: ReadingMarkAppearance? = nil) throws -> PDFReadingMark? {
+        var mark: PDFReadingMark
+        if let passage, let page { mark = draftExcerpt(passage, page: page) }
+        else { mark = try draft(kind: .annotation) }
+        mark.isExcerpt = true
+        if let appearance { mark.appearance = appearance }
+        return save(mark, remembering: appearance) ? mark : nil
+    }
+
+    func draftExcerpt(_ passage: FoldedPDFPassage, page: Int) -> PDFReadingMark {
+        let lines = sourceLines(of: passage, page: page)
+        let candidate = (try? draft(kind: .annotation, lines: lines, text: passage.text))
+            ?? PDFReadingMark(kind: .annotation, revision: revision, location: location(of: passage, on: page),
+                              lines: [], quote: passage.text, note: "")
+        var mark = preparedMark(candidate)
+        mark.isExcerpt = true
+        return mark
+    }
+
+    @discardableResult func save(_ mark: PDFReadingMark, remembering appearance: ReadingMarkAppearance? = nil) -> Bool {
         var mark = mark
         if mark.revision == revision {
-            mark.printedPage = printedPageLabel(at: mark.location.page)
+            let pages = mark.lines.map(\.page) + [mark.location.page]
+            let first = pages.min() ?? mark.location.page
+            let last = pages.max() ?? first
+            mark.printedPage = publicationPageLabel(at: first)
+            mark.printedPageEnd = last > first ? publicationPageLabel(at: last) : nil
         }
         var next = marks
         if let index = next.firstIndex(where: { $0.id == mark.id }) {
@@ -471,7 +782,7 @@ final class PDFReader: ObservableObject {
         } else {
             next.append(mark)
         }
-        return next == marks || updateMarks(next)
+        return updateMarks(next, remembering: appearance)
     }
 
     func discardDraft() {
@@ -517,8 +828,12 @@ final class PDFReader: ObservableObject {
         canUndo = !undoMarks.isEmpty
     }
 
-    @discardableResult private func updateMarks(_ next: [PDFReadingMark]) -> Bool {
-        guard let store = store, store.updatePDFReading(itemID, { $0.marks = next }) else { return false }
+    @discardableResult private func updateMarks(_ next: [PDFReadingMark], remembering appearance: ReadingMarkAppearance? = nil) -> Bool {
+        guard let store else { return false }
+        let changed = marks != next
+        if !changed && (appearance == nil || store.library.preferences.readingMarkAppearance == appearance) { return true }
+        guard store.updatePDFReading(itemID, markAppearance: appearance, { $0.marks = next }) else { return false }
+        guard changed else { return true }
         undoMarks.append(marks)
         if undoMarks.count > 12 { undoMarks.removeFirst() }
         marks = next
@@ -527,7 +842,8 @@ final class PDFReader: ObservableObject {
     }
 
     func highlights(in view: PDFView) -> [(mark: PDFReadingMark, rect: CGRect)] {
-        let visible = Dictionary(uniqueKeysWithValues: view.visiblePages.map { (document.index(for: $0), $0) })
+        guard let shown = view.document else { return [] }
+        let visible = Dictionary(uniqueKeysWithValues: view.visiblePages.map { (shown.index(for: $0), $0) })
         return marks.filter { $0.revision == revision && $0.kind == .annotation }.flatMap { mark in
             mark.lines.compactMap { line in
                 guard let page = visible[line.page] else { return nil }
@@ -542,22 +858,29 @@ final class PDFReader: ObservableObject {
         revealedNote = mark.id
     }
 
-    func setColor(_ color: PDFMarkColor, for mark: PDFReadingMark) {
-        var updated = mark
+    func setColor(_ color: ReadingMarkColor, for mark: PDFReadingMark) {
+        guard var updated = marks.first(where: { $0.id == mark.id }) else { return }
         updated.color = color
         _ = save(updated)
     }
 
+    func setStyle(_ style: ReadingMarkStyle, for mark: PDFReadingMark) {
+        guard var updated = marks.first(where: { $0.id == mark.id }) else { return }
+        updated.style = style
+        _ = save(updated)
+    }
 }
 
 extension ReadingStore {
-    func updatePDFReading(_ id: UUID, reportError: Bool = true, _ change: (inout PDFReadingState) -> Void) -> Bool {
+    func updatePDFReading(_ id: UUID, reportError: Bool = true, markAppearance: ReadingMarkAppearance? = nil,
+                          _ change: (inout PDFReadingState) -> Void) -> Bool {
         guard library.items.contains(where: { $0.id == id && $0.trashedAt == nil }) else { return false }
         return commit(reportError: reportError) { library in
             guard let index = library.items.firstIndex(where: { $0.id == id }) else { return }
             var reading = library.items[index].pdfReading ?? PDFReadingState()
             change(&reading)
             library.items[index].pdfReading = reading
+            if let markAppearance { library.preferences.readingMarkAppearance = markAppearance }
         }
     }
 
@@ -614,7 +937,6 @@ extension ReadingStore {
 
     func toggleReadingFocus() {
         if let reader = pdfReader {
-            guard reader.saveDraft() else { return }
             reader.isFocused.toggle()
             return
         }

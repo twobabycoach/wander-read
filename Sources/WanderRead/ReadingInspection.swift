@@ -14,6 +14,7 @@ struct ReadingInspection: Identifiable {
     let purpose: Purpose
     var quote = ""
     var knownURL: URL?
+    var isRegion = false
 
     var isCandidate: Bool {
         if case .candidate = purpose { return true }
@@ -149,10 +150,10 @@ extension ReadingStore {
     }
 
     func inspectPDF(_ reader: PDFReader, at location: PDFReadingLocation, lines: [PDFReadingLine] = [],
-                    note: UUID? = nil, quote: String = "") {
+                    note: UUID? = nil, quote: String = "", isRegion: Bool = false) {
         guard let item = library.items.first(where: { $0.id == reader.itemID }) else { return }
         inspection = ReadingInspection(item: item, purpose: .pdf(location, revision: reader.revision, lines: lines, note: note),
-                                       quote: quote, knownURL: reader.url)
+                                       quote: quote, knownURL: reader.url, isRegion: isRegion)
     }
 
     func inspectText(_ reader: TextReader, excerpt: TextExcerpt) {

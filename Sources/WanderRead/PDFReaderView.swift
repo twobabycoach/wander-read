@@ -7,18 +7,24 @@ struct PDFReaderView: View {
     @ObservedObject var store: ReadingStore
     @State private var expandedSection: Int?
     @State private var chapters: [PDFChapter] = []
-    @State private var inferredSections: [PDFReadingSection]?
+    @State private var navigationPresented = false
     @State private var outlineEditor: OutlineSheet?
-    @State private var documentFoldUnit: PDFFoldUnit?
-    @State private var readingPageGroup = false
     @State private var sourceChapterPages: [PDFFoldedPage] = []
     @State private var chapterPages: [PDFFoldedPage] = []
     @State private var foldRestore: FoldRestore?
-    private struct FoldRestore { let id = UUID(); let position: PDFFoldPosition }
-    private struct FoldScroll: Equatable { let id: UUID; let destination: PDFFoldPosition }
+    @State private var foldLoad: FoldLoad?
+    private struct FoldLoad: Equatable {
+        let id = UUID()
+        let chapterID: Int
+        let pages: Range<Int>
+        var restore: PDFFoldPosition?
+    }
+    private struct FoldRestore { let id = UUID(); let position: PDFFoldPosition? }
+    private struct FoldScroll: Equatable { let id: UUID; let destination: FoldRow.ID }
     private struct OutlineSheet: Identifiable {
         let id = UUID()
         var manual: PDFOutlineCandidate?
+        var reviewPending = false
     }
     private struct SplitRequest: Identifiable {
         let id = UUID()
@@ -28,7 +34,7 @@ struct PDFReaderView: View {
 
     private enum FoldRow: Identifiable {
         enum ID: Hashable {
-            case chapter(Int), page(Int), position(PDFFoldPosition), loading
+            case chapter(Int), page(Int), position(PDFFoldPosition), loading, earlier, later, nextChapter
         }
         case chapter(PDFChapter)
         case page(Int, depth: Int)
@@ -36,6 +42,9 @@ struct PDFReaderView: View {
         case notes(PDFFoldedPage, depth: Int)
         case empty(PDFFoldedPage, depth: Int)
         case loading(depth: Int)
+        case earlier(depth: Int)
+        case later(depth: Int)
+        case nextChapter(PDFChapter)
 
         var id: ID {
             switch self {
@@ -45,32 +54,42 @@ struct PDFReaderView: View {
             case .notes(let page, _): return .position(page.footnotePosition)
             case .empty(let page, _): return .position(PDFFoldPosition(page: page.id))
             case .loading: return .loading
+            case .earlier: return .earlier
+            case .later: return .later
+            case .nextChapter: return .nextChapter
             }
         }
     }
     @State private var openedPassages = Set<String>()
     @State private var openedFootnotes = Set<Int>()
-    @State private var loadKey = UUID()
-    @State private var loadingPages = false
-    @State private var showFullPassages = false
     @State private var related = false
-    @State private var notebook = false
+    @State private var notebooks = ReaderNotebookVisibility()
     @State private var jumping = false
-    @State private var excerptsOnly = false
+    @State private var noteFilter = ReadingNoteFilter()
     @State private var selectingNotes = false
     @State private var selectedNotes = Set<UUID>()
     @StateObject private var transfer = NotebookSendState()
     @StateObject private var relatedSearch = ReadingRelatedSearch()
+    @StateObject private var translation = ReadingTranslationSession()
+    @StateObject private var comparison = PDFComparisonWindowController()
+    @State private var openingComparison = false
     @State private var justExcerpted: UUID?
     private var visibleMarks: [PDFReadingMark] {
-        reader.marks.reversed().filter { !excerptsOnly || $0.isExcerpt == true }
+        if !noteFilter.isFiltering { return Array(reader.marks.reversed()) }
+        return reader.marks.reversed().filter {
+            $0.id == reader.noteDraft?.id || noteFilter.matches(
+                color: $0.lines.isEmpty ? nil : $0.appearance.color, isExcerpt: $0.isExcerpt == true,
+                text: $0.quote, $0.note, notePlace($0), ReaderNote($0).kind)
+        }
     }
     private var layout: FocusLayout { (store.library.preferences.focusLayout ?? FocusLayout()).normalized() }
+    private var notebook: Bool { notebooks[focused: reader.isFocused] || reader.noteDraft != nil }
+    private var markAppearance: ReadingMarkAppearance { store.library.preferences.readingMarkAppearance ?? ReadingMarkAppearance() }
     @State private var pageEntry = ""
     @State private var highlightCopied: UUID?
     @State private var scanEditor: ScanEditorID?
+    @State private var quoteEditor: ScanEditorID?
     private struct ScanEditorID: Identifiable { let id: UUID }
-    @FocusState private var noteFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -94,16 +113,30 @@ struct PDFReaderView: View {
             Divider()
             HStack(spacing: 0) {
                 ZStack {
-                    PDFCanvas(reader: reader, background: reader.isFocused ? layout.paper : Palette.side)
+                    PDFCanvas(reader: reader, background: reader.isFocused ? layout.desk : Palette.side,
+                              layoutWidth: reader.isFocused ? layout.width : 920, notebook: notebook,
+                              sentence: translation.pdfSentence,
+                              pointTranslate: translation.pointMode ? translateSentence : nil)
+                        .overlay {
+                            if !reader.showOutline, !reader.selectingRegion, let anchor = reader.selectionAnchor {
+                                ReadingSelectionPalette(
+                                    anchor: anchor, appearance: markAppearance, excerpt: { excerpt() },
+                                    annotate: { capture(.annotation, edit: true) },
+                                    useColor: { excerpt(appearance: ReadingMarkAppearance(color: $0, style: markAppearance.style)) },
+                                    setStyle: setMarkStyle, findRelated: searchSelection, copy: copySelection,
+                                    translate: translateSelection
+                                )
+                            }
+                        }
                         .accessibilityHidden(reader.showOutline)
                         .frame(maxWidth: reader.isFocused ? layout.width : 920)
                         .frame(maxWidth: .infinity)
                         .background(reader.isFocused ? layout.desk : Palette.side)
-                    if reader.showOutline { outline.frame(maxWidth: reader.isFocused ? layout.width : .infinity) }
+                    if reader.showOutline { outline }
                 }
                 if notebook {
                     Divider()
-                    notePanel.frame(width: reader.isFocused ? layout.notebookWidth : 310)
+                    notePanel.frame(width: reader.isFocused ? layout.notebookWidth : 326)
                 }
             }
             Divider()
@@ -111,23 +144,18 @@ struct PDFReaderView: View {
         }
         .foregroundColor(Palette.ink)
         .background(Palette.paper)
-        .sheet(isPresented: $transfer.configuring) {
-            NotebookExportEditor(store: store, pendingCount: transfer.pending.count) {
-                transfer.send(transfer.pending, from: reader.itemID, store: store)
-                transfer.pending = []
-            }
-        }
+        .modifier(ReadingTranslationOverlay(store: store, session: translation, pdfTools: AnyView(translationTools)))
+        .notebookSheets(transfer, store: store, itemID: reader.itemID)
         .onAppear {
             if reader.revealedNote != nil { setNotebook(true) }
-            if reader.showOutline && chapters.isEmpty { resetChapters() }
+            if reader.showOutline && chapters.isEmpty { beginFolding() }
         }
         .sheet(item: $scanEditor) { PDFScanEditor(reader: reader, noteID: $0.id) }
+        .sheet(item: $quoteEditor) { PDFQuoteRepairEditor(reader: reader, noteID: $0.id) }
+        .onDisappear { comparison.close() }
         .sheet(item: $outlineEditor) { request in
-            PDFOutlineEditor(reader: reader, manual: request.manual) {
-                documentFoldUnit = .chapter
-                readingPageGroup = false
-                reader.showOutline = true
-                resetChapters()
+            PDFOutlineEditor(reader: reader, store: store, manual: request.manual, reviewPending: request.reviewPending) {
+                if reader.showOutline { resetChapters() }
             }
         }
         .sheet(isPresented: $related) { RelatedReadingView(store: store, anchor: store.activeItem) }
@@ -141,144 +169,161 @@ struct PDFReaderView: View {
         }
         .onChange(of: reader.foldCorrections) { _ in
             if let position = reader.foldPosition { foldRestore = FoldRestore(position: position) }
-            chapterPages = reader.correctedFoldPages(sourceChapterPages)
+            rebuildFoldedPages()
         }
-        .onChange(of: reader.isFocused) { focused in
-            if focused { setNotebook(false) }
+        .onChange(of: reader.isFocused) { _ in
+            preserveFoldPosition()
+        }
+        .onChange(of: layout) { _ in
+            if reader.isFocused { preserveFoldPosition() }
+        }
+        .onChange(of: store.library.preferences.readingAid) { _ in
+            if reader.showOutline { preserveFoldPosition() }
         }
         .onChange(of: reader.revealedNote) { id in
-            if id != nil && reader.saveDraft() { excerptsOnly = false; setNotebook(true) }
+            if let id, reader.noteDraft?.id == id || reader.saveDraft() {
+                if let mark = reader.marks.first(where: { $0.id == id }) { includeInNotes(mark) }
+                setNotebook(true)
+            }
+        }
+        .onChange(of: noteFilter) { _ in
+            selectedNotes.formIntersection(visibleMarks.map(\.id))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ReadingCommand.notification, object: store)) { event in
+            guard let command = event.userInfo?["command"] as? ReadingCommand else { return }
+            switch command {
+            case .excerpt: excerpt()
+            case .annotation: capture(.annotation, edit: true, pageOnly: !reader.hasSelection)
+            case .highlight: capture(.annotation, edit: false)
+            case .translate: translateSelection()
+            }
         }
         .onChange(of: reader.showOutline) { showing in
+            translation.clearSentence()
             if showing {
                 reader.selectingRegion = false
-                if chapters.isEmpty {
-                    resetChapters()
-                } else {
-                    openCurrentFold()
-                }
+                beginFolding()
             } else {
                 foldRestore = nil
+                foldLoad = nil
             }
         }
-        .task(id: findingOutline) {
-            guard findingOutline else { return }
-            let url = reader.url
-            let pageCount = reader.document.pageCount
-            let worker = Task.detached(priority: .utility) {
-                let entries = PDFOutlineBuilder.generate(at: url).filter { !$0.isPending }
-                return PDFOutlineCandidate.sections(from: entries, pageCount: pageCount) ?? []
+        .onChange(of: reader.selectingRegion) { if $0 { translation.clearSentence() } }
+        .onChange(of: reader.detectedOutline) { _ in
+            if reader.showOutline && reader.foldOptions.unit == .chapter && reader.savedOutline.isEmpty && foundOutline {
+                resetChapters()
             }
-            let result = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
-            guard !Task.isCancelled else { return }
-            inferredSections = result
-            if !result.isEmpty && !readingPageGroup { resetChapters() }
         }
-        .task(id: loadKey) {
-            guard let id = expandedSection, let chapter = chapters.first(where: { $0.id == id }) else { return }
-            let pages = chapter.pages(total: reader.document.pageCount)
-            var nextPages: [PDFFoldedPage] = []
-            var pending: PDFFoldedPage?
-            loadingPages = true
-            for index in pages {
-                guard !Task.isCancelled else { return }
-                var page = reader.foldedPage(index, in: chapter)
-                if var previous = pending {
-                    reader.stitchFoldedPages(&previous, &page)
-                    nextPages.append(previous)
+        .task(id: foldLoad) {
+            guard let request = foldLoad, let chapter = expandedChapter, chapter.id == request.chapterID else { return }
+            var pages: [PDFFoldedPage] = []
+            for index in request.pages {
+                guard !Task.isCancelled, foldLoad == request else { return }
+                pages.append(reader.foldedPage(index, in: chapter))
+                await Task.yield()
+            }
+            guard !Task.isCancelled, foldLoad == request else { return }
+            if let position = request.restore {
+                foldRestore = FoldRestore(position: reader.foldPosition ?? position)
+            }
+            sourceChapterPages = (sourceChapterPages + pages).sorted { $0.id < $1.id }
+            rebuildFoldedPages()
+            foldLoad = nil
+        }
+    }
+
+    private func rebuildFoldedPages() {
+        chapterPages = reader.correctedFoldPages(reader.stitchedFoldPages(sourceChapterPages))
+        if let target = reader.foldReflowTarget, let offset = target.offset {
+            for page in chapterPages where page.id <= target.page {
+                if let passage = page.passages.first(where: { passage in
+                    passage.sources(startingOn: page.id).contains {
+                        $0.page == target.page && NSLocationInRange(offset, $0.range)
+                    }
+                }) {
+                    openedPassages.insert("\(page.id):\(passage.id)")
+                    break
                 }
-                pending = page
-                if nextPages.count == 4 || (chapterPages.isEmpty && !nextPages.isEmpty) {
-                    appendChapterPages(nextPages)
-                    nextPages.removeAll(keepingCapacity: true)
-                }
-                try? await Task.sleep(nanoseconds: 12_000_000)
             }
-            if let pending { nextPages.append(pending) }
-            if !Task.isCancelled { appendChapterPages(nextPages) }
-            if !Task.isCancelled { loadingPages = false }
         }
     }
 
-    private func appendChapterPages(_ pages: [PDFFoldedPage]) {
-        guard !pages.isEmpty else { return }
-        sourceChapterPages += pages
-        chapterPages = reader.correctedFoldPages(sourceChapterPages)
-    }
-
-    private var preferredFoldUnit: PDFFoldUnit {
-        documentFoldUnit ?? (reader.savedOutline.isEmpty ? store.library.preferences.pdfFoldUnit : .chapter) ?? .chapter
-    }
-    private var foundOutline: Bool { !reader.savedOutline.isEmpty || inferredSections?.isEmpty == false }
-    private var outlineName: String { reader.savedOutline.isEmpty ? "识别目录" : "我的目录" }
-    private var findingOutline: Bool {
-        reader.showOutline && preferredFoldUnit == .chapter && !reader.hasAuthorOutline &&
-            reader.savedOutline.isEmpty && inferredSections == nil
-    }
-
+    private var expandedChapter: PDFChapter? { chapters.first { $0.id == expandedSection } }
+    private var foundOutline: Bool { !reader.navigationSections.isEmpty }
     private var foldUnit: PDFFoldUnit {
-        if preferredFoldUnit == .chapter && !reader.hasAuthorOutline && (!foundOutline || readingPageGroup) { return .group }
-        return preferredFoldUnit
+        reader.foldOptions.unit == .chapter && !foundOutline ? .group : reader.foldOptions.unit
     }
-
-    private var outlineHint: String {
-        if foldUnit == .chapter {
-            if reader.hasAuthorOutline { return "按 PDF 目录展开一章，跨页接着读。段落仍能回到原页。" }
-            if !reader.savedOutline.isEmpty { return "按已保存的目录展开章节，随时可以核对原页。" }
-            return "根据原书目录或正文标题整理。展开可跨页阅读，底部也可切回按页。"
-        }
-        if reader.hasAuthorOutline { return "按所选页数浏览。也可以切回目录章节。" }
-        if findingOutline { return "正在本机查找章节。现在也可以按页段阅读。" }
-        if foundOutline { return "已识别章节，可在底部切换。当前按页段阅读。" }
-        if inferredSections != nil { return "暂未找到可直接使用的章节。可按页读，或打开「生成目录」查看识别结果。" }
-        return "这份 PDF 没有内置目录，可以按页阅读或生成目录。"
-    }
-
-    private var groupSize: Int { min(20, max(2, store.library.preferences.pdfFoldPages ?? 3)) }
+    private var groupSize: Int { min(20, max(2, reader.foldOptions.pages)) }
+    private var showFullPassages: Bool { reader.foldOptions.fullPassages }
 
     private var toolbar: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 8) {
             ReadingIconButton(title: "保存位置并返回漫读", systemImage: "chevron.left", action: leave)
             if !reader.isFocused {
-                Text(reader.title).font(.system(size: 14, weight: .semibold)).lineLimit(1).help(reader.title)
+                Text(reader.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).help(reader.title)
             }
             Spacer(minLength: 12)
-            Picker("阅读层次", selection: $reader.showOutline) {
-                Text("原页").tag(false)
-                Text("折叠").tag(true)
+            Group {
+                ReadingTabs(selection: Binding(get: { reader.showOutline }, set: setFoldedView),
+                            options: [(false, "原页"), (true, "折叠")])
+                Divider().frame(height: 15).padding(.horizontal, 3)
+                Button(action: openNavigation) { Label("目录", systemImage: "list.bullet.indent") }
+                    .buttonStyle(ReadingControlStyle(selected: navigationPresented))
+                    .help("目录与书签 · ⇧⌘O")
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .popover(isPresented: $navigationPresented, arrowEdge: .bottom) {
+                        PDFReadingNavigation(reader: reader, onSection: goToSection, onPage: goToPage,
+                                             onBookmark: goToBookmark, onEdit: openOutlineEditor, onToggleBookmark: toggleBookmark)
+                    }
+                ReadingIconButton(title: reader.bookmarkHere == nil ? "添加书签 · ⌘B" : "移除此处书签 · ⌘B",
+                                  systemImage: reader.bookmarkHere == nil ? "bookmark" : "bookmark.fill",
+                                  selected: reader.bookmarkHere != nil, action: toggleBookmark)
+                    .keyboardShortcut("b", modifiers: .command)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 126)
-            Button {
-                if notebook && !reader.saveDraft() { return }
-                setNotebook(!notebook)
-            } label: {
-                Label(notebook ? "收起笔记" : "笔记", systemImage: "sidebar.right")
+            ReadingIconButton(title: notebook ? "收起摘录与批注" : "打开摘录与批注",
+                              systemImage: "sidebar.right", selected: notebook) {
+                let shouldOpen = !notebook
+                if shouldOpen || reader.saveDraft() { setNotebook(shouldOpen) }
             }
-            Button(action: store.toggleReadingFocus) {
-                Label(reader.isFocused ? "退出专注" : "专注", systemImage: reader.isFocused ? "arrow.down.right.and.arrow.up.left" : "viewfinder")
+            ReadingAidButton(store: store, inOriginalPDF: !reader.showOutline, canReflow: {
+                let page = reader.readingAidOrigin().page
+                return reader.sourceText(page: page)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            }) {
+                setFoldedView(true, forReadingAid: true)
             }
-            .help("切换专注阅读 ⇧⌘F")
-            if !reader.showOutline {
-                Button {
+            Group {
+                translationButton
+                ReadingPointTranslationButton(session: translation).disabled(reader.selectingRegion)
+                ReadingFocusButton(focused: reader.isFocused, toggle: store.toggleReadingFocus)
+            }
+            if !reader.showOutline && !reader.isFocused {
+                ReadingIconButton(title: "框选图摘", systemImage: "crop", selected: reader.selectingRegion) {
                     guard reader.saveDraft() else { return }
                     reader.selectingRegion.toggle()
-                } label: { Label(reader.selectingRegion ? "正在框选" : "框选", systemImage: "crop") }
-                    .help("框选原页图像，可再识别文字")
+                }
             }
-            if reader.isFocused { FocusLayoutButton(store: store) }
+            if reader.isFocused {
+                FocusLayoutButton(store: store, originalPDF: !reader.showOutline)
+                if !reader.showOutline {
+                    Menu {
+                        Button("框选图摘") {
+                            guard reader.saveDraft() else { return }
+                            reader.selectingRegion.toggle()
+                        }
+                    } label: { Image(systemName: "ellipsis").frame(width: 24, height: 28) }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 28).accessibilityLabel("更多阅读操作")
+                }
+            }
             if !reader.isFocused {
                 Menu {
                     if !reader.hasAuthorOutline {
-                        Button(reader.savedOutline.isEmpty ? "生成目录…" : "编辑目录…") { outlineEditor = OutlineSheet() }
                         if !reader.showOutline {
                             Button("从此处加章节…") {
                                 let anchor = reader.outlineEntryAtSelection()
                                 outlineEditor = OutlineSheet(manual: PDFOutlineCandidate(title: anchor.title, location: anchor.location))
                             }
+                            Divider()
                         }
-                        Divider()
                     }
                     Button("查相似文献") { related = true }
                     Button("用原阅读器打开") {
@@ -293,30 +338,112 @@ struct PDFReaderView: View {
                 } label: { Image(systemName: "ellipsis") }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
-                .frame(width: 34)
+                .frame(width: 28)
                 .accessibilityLabel("更多阅读操作")
             }
 
         }
         .buttonStyle(.borderless)
         .font(.system(size: 13, weight: .medium))
-        .padding(.horizontal, 24)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+    }
+
+    private var translationButton: some View {
+        ReadingTranslationButton(session: translation) {
+            if translation.presented { translation.close() }
+            else if reader.translationSelection != nil { translateSelection() }
+            else { translation.open(.pdf) }
+        }
+    }
+
+    private var translationTools: some View {
+        PDFTranslationControls(source: reader.translationSource, page: reader.location.page,
+                               archive: store.translations, settings: translationSettings,
+                               changeSourceLanguage: { language in
+                                   var updated = translationSettings
+                                   updated.pdfSource = language
+                                   store.commit { $0.preferences.translation = updated }
+                               },
+                               jobs: store.pdfTranslationJobs, configure: { translation.configuring = true },
+                               open: openComparison)
+    }
+
+    private var translationSettings: ReadingTranslationSettings {
+        store.library.preferences.translation ?? ReadingTranslationSettings()
+    }
+
+    private func translateSelection() {
+        if let passage = reader.translationSelection {
+            translation.show(passage, settings: translationSettings, archive: store.translations)
+        }
+    }
+
+    private func translateSentence(_ hit: PDFSentenceHit, panelOnLeadingEdge: Bool) {
+        let page = reader.document.index(for: hit.page)
+        guard (0..<reader.document.pageCount).contains(page) else { return }
+        let passage = TranslationPassage(text: hit.text, title: reader.title, place: reader.pageReference(page),
+                                         document: reader.translationDocument, suspectedEncodingError: hit.suspectedEncodingError)
+        translation.show(passage, settings: translationSettings, archive: store.translations,
+                         sentence: .pdf(hit, panelOnLeadingEdge: panelOnLeadingEdge))
+    }
+
+    private func translatePassage(_ passage: FoldedPDFPassage, page: Int, sentence: NSRange? = nil) {
+        let first = reader.pageReference(page)
+        let place = passage.sources(startingOn: page).last?.page ?? page
+        let reference = place == page ? first : "PDF 第 \(page + 1)–\(place + 1) 页"
+        let full = passage.displayText
+        let text: String
+        if let sentence {
+            guard let range = Range(sentence, in: full) else { return }
+            text = ReadingSentence.translationText(String(full[range]))
+        } else { text = full }
+        let request = TranslationPassage(text: text, title: reader.title, place: reference,
+                                         document: reader.translationDocument,
+                                         suspectedEncodingError: PDFQuoteQuality.isSuspicious(sentence == nil ? passage.text : text))
+        translation.show(request, settings: translationSettings, archive: store.translations,
+                         sentence: sentence.map { .folded(page: page, passage: passage.id, range: $0) })
+    }
+
+    private func openComparison(_ file: PDFTranslationFile?, follow: Bool) {
+        guard !comparison.bringForward(), !openingComparison else { return }
+        openingComparison = true
+        let source = reader.translationSource
+        let verification = Task.detached(priority: .userInitiated) {
+            (try? PDFReader.fingerprint(source.url)) == source.document.revision
+        }
+        Task { @MainActor in
+            defer { openingComparison = false }
+            let matches = await verification.value
+            guard store.pdfReader === reader else { return }
+            guard matches, let original = PDFDocument(url: source.url), !original.isLocked,
+                  original.pageCount == source.pageCount else {
+                store.error = "无法打开这份对照。请重新打开原 PDF，或重新关联译文。"
+                return
+            }
+            translation.close()
+            let request = PDFBilingualRequest(original: original, source: source, startingFile: file,
+                                               title: reader.title, startPage: reader.location.page, follow: follow)
+            comparison.present(request, reader: reader, store: store) { page in
+                if reader.showOutline || page != reader.location.page {
+                    reader.showSource(at: PDFReadingLocation(page: page))
+                }
+            }
+        }
     }
 
     private var footer: some View {
         HStack(spacing: 10) {
             if reader.showOutline {
                 foldUnitMenu
-                Picker("折叠深度", selection: $showFullPassages) {
-                    Text("原句速览").tag(false)
-                    Text("原段").tag(true)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 148)
+                ReadingTabs(selection: Binding(get: { showFullPassages }, set: { value in
+                    var options = reader.foldOptions
+                    options.fullPassages = value
+                    reader.setFoldOptions(options)
+                }), options: [(false, "原句速览"), (true, "原段")])
                     .help("速览显示段内原句，展开可读同一段全文")
-                Toggle("词首强调", isOn: Binding(
-                    get: { store.library.preferences.readingWordEmphasis == true },
-                    set: { value in store.updatePreferences { $0.readingWordEmphasis = value } }
-                )).toggleStyle(.switch).controlSize(.small).tint(Palette.green)
+                Text("PDF 第 \(reader.location.page + 1) 页")
+                    .font(.system(size: 11)).foregroundColor(Palette.muted).monospacedDigit()
             } else {
                 Button {
                     movePage(-1)
@@ -359,24 +486,26 @@ struct PDFReaderView: View {
             }
             if !reader.showOutline {
                 if reader.hasSelection {
-                    ReadingExcerptButton { excerpt() }
-                    Button { capture(.annotation, edit: false) } label: { Label("划线", systemImage: "highlighter") }
-                        .keyboardShortcut("h", modifiers: [.command, .shift]).help("划线 · ⇧⌘H")
-                    Button("查相关") {
-                        if let quote = reader.selectedQuote { searchRelated(quote) }
-                    }.help("用所选文字查相关原文")
-                } else if justExcerpted == nil {
-                    Text("选中文字可摘录").font(.system(size: 12)).foregroundColor(Palette.muted)
+                    if reader.selectionAnchor == nil {
+                        ReadingExcerptButton { excerpt() }
+                        ReadingAnnotationButton { capture(.annotation, edit: true) }
+                        Button("翻译", action: translateSelection).buttonStyle(ReadingControlStyle())
+                        Button("查相关", action: searchSelection).buttonStyle(ReadingControlStyle())
+                    }
+                    ReadingIconButton(title: "仅标记选区 · ⇧⌘H", systemImage: "highlighter") {
+                        capture(.annotation, edit: false)
+                    }
+                } else {
+                    if reader.isFocused {
+                        ReadingIconButton(title: "页边记 · ⇧⌘N", systemImage: "square.and.pencil") {
+                            capture(.annotation, edit: true, pageOnly: true)
+                        }
+                    } else {
+                        ReadingAnnotationButton(title: "页边记") { capture(.annotation, edit: true, pageOnly: true) }
+                    }
                 }
-                Button {
-                    capture(.annotation, edit: true, pageOnly: !reader.hasSelection)
-                } label: {
-                    Label(reader.hasSelection ? "批注" : "页边记", systemImage: "square.and.pencil")
-                }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
-                .help("选中文字后批注，也可直接在当前页写一笔")
             }
-            Button { capture(.detour, edit: true) } label: { Label("先放这里", systemImage: "tray.and.arrow.down") }
+            ReadingIconButton(title: "先放这里 · ⇧⌘D", systemImage: "tray.and.arrow.down") { capture(.detour, edit: true) }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
             if let justExcerpted {
                 ReadingExcerptNotice { revealExcerpt(justExcerpted) }
@@ -389,30 +518,33 @@ struct PDFReaderView: View {
         }
         .buttonStyle(.borderless)
         .font(.system(size: 13))
-        .padding(.horizontal, 24)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 5)
     }
 
     private var foldUnitMenu: some View {
-        Menu {
-            Button("按文档自动") { setFoldUnit(nil) }
-            if reader.hasAuthorOutline { Button("目录章节") { setFoldUnit(.chapter) } }
-            else if foundOutline || inferredSections == nil {
-                Button(foundOutline ? outlineName : "尝试识别正文目录") { setFoldUnit(.chapter) }
-            }
-            Button("单页") { setFoldUnit(.page) }
+        let automaticFallback = reader.foldOptions.unit == .chapter && foldUnit == .group
+        return Menu {
+            foldUnitOption("按目录自动", .chapter)
+            foldUnitOption("单页", .page)
             Menu("连续页段") {
                 ForEach([2, 3, 5, 10, 20], id: \.self) { count in
-                    Button("每 \(count) 页") { setFoldUnit(.group, pages: count) }
+                    foldUnitOption("每 \(count) 页", .group, pages: count)
                 }
             }
-            if !reader.hasAuthorOutline {
-                Divider()
-                Button(reader.savedOutline.isEmpty ? "生成目录…" : "编辑目录…") { outlineEditor = OutlineSheet() }
-            }
         } label: {
-            Label(foldUnit == .group ? "每 \(groupSize) 页" : foldUnit == .chapter && !reader.hasAuthorOutline ? outlineName : foldUnit.title, systemImage: "list.bullet.indent")
-        }.menuStyle(.borderlessButton).fixedSize().help("选择折叠单位")
+            let title = foldUnit == .group ? "每 \(groupSize) 页" : foldUnit.title
+            Label(automaticFallback ? "自动 · " + title : title, systemImage: "rectangle.split.1x2")
+        }.menuStyle(.borderlessButton).fixedSize()
+            .help(automaticFallback ? "暂无可用目录，暂按连续页段折叠" : "这份 PDF 的折叠方式")
+    }
+
+    private func foldUnitOption(_ title: String, _ unit: PDFFoldUnit, pages: Int? = nil) -> some View {
+        let selected = reader.foldOptions.unit == unit && (pages == nil || pages == groupSize)
+        return Button { setFoldUnit(unit, pages: pages) } label: {
+            if selected { Label(title, systemImage: "checkmark") }
+            else { Text(title) }
+        }
     }
 
     private var outline: some View {
@@ -420,69 +552,66 @@ struct PDFReaderView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text("折叠阅读").font(.system(size: 34, weight: .medium, design: .serif))
-                                Spacer()
-                                if !reader.hasAuthorOutline {
-                                    Button { outlineEditor = OutlineSheet() } label: {
-                                        Label(reader.savedOutline.isEmpty ? "生成目录…" : "编辑目录…", systemImage: "list.bullet.rectangle")
-                                            .font(.system(size: 13, weight: .medium)).padding(.vertical, 5)
-                                    }.buttonStyle(.borderless)
-                                }
-                            }
-                            Text(outlineHint)
-                                .font(.system(size: 14)).foregroundColor(Palette.muted)
-                        }.padding(.bottom, 24)
+                        if reader.findingOutline && foldUnit == .group && reader.foldOptions.unit == .chapter {
+                            ProgressView("正在识别目录，可以先按页段读").controlSize(.small)
+                                .font(.system(size: 12)).foregroundColor(Palette.muted).padding(.bottom, 14)
+                        }
                         ForEach(foldRows) { row in
                             foldRow(row).id(row.id)
                         }
                     }
-                    .frame(maxWidth: reader.isFocused ? layout.width : 720, alignment: .leading)
-                    .padding(.horizontal, 26).padding(.vertical, 26).frame(maxWidth: .infinity)
+                    .padding(.horizontal, 26).padding(.vertical, 26)
+                    .frame(minHeight: viewport.size.height, alignment: .topLeading)
                 }
+                .frame(maxWidth: reader.isFocused ? layout.width : 772)
+                .background(reader.isFocused ? layout.paper : Palette.paper)
+                .frame(maxWidth: .infinity)
                 .coordinateSpace(name: "folded-reading")
-                .onAppear {
-                    if foldRestore == nil, let id = expandedSection { proxy.scrollTo(FoldRow.ID.chapter(id), anchor: .top) }
-                }
                 .task(id: readyFoldScroll) {
                     guard let request = readyFoldScroll else { return }
                     await Task.yield()
                     guard !Task.isCancelled, foldRestore?.id == request.id else { return }
-                    proxy.scrollTo(FoldRow.ID.position(request.destination), anchor: .top)
+                    proxy.scrollTo(request.destination, anchor: .top)
                     try? await Task.sleep(nanoseconds: 80_000_000)
                     if !Task.isCancelled && foldRestore?.id == request.id { foldRestore = nil }
                 }
                 .onPreferenceChange(FoldRowFrames.self) { frames in
-                    DispatchQueue.main.async { updateFoldPosition(frames, height: viewport.size.height) }
+                    let section = expandedSection
+                    DispatchQueue.main.async {
+                        if expandedSection == section { updateFoldPosition(frames, height: viewport.size.height) }
+                    }
                 }
             }
-        }.background(reader.isFocused ? layout.paper : Palette.paper)
+        }.background(reader.isFocused ? layout.desk : Palette.paper)
             .accessibilityIdentifier("PDFOutline")
     }
 
     private var readyFoldScroll: FoldScroll? {
-        guard let request = foldRestore, let page = chapterPages.first(where: { $0.id == request.position.page }) else { return nil }
-        if let offset = request.position.offset, page.footnotes.contains(where: { NSLocationInRange(offset, $0.range) }) {
-            return FoldScroll(id: request.id, destination: page.footnotePosition)
+        guard let request = foldRestore, let chapter = expandedChapter else { return nil }
+        guard let position = request.position else {
+            return FoldScroll(id: request.id, destination: .chapter(chapter.id))
         }
-        let chapter = chapters.first { $0.id == expandedSection }
+        guard let page = chapterPages.first(where: { $0.id == position.page }) else { return nil }
+        if let offset = position.offset, page.footnotes.contains(where: { NSLocationInRange(offset, $0.range) }) {
+            return FoldScroll(id: request.id, destination: .position(page.footnotePosition))
+        }
         for candidate in chapterPages.reversed() where candidate.id <= page.id {
             if let passage = bodyPassages(on: candidate, in: chapter).first(where: { passage in
                 passage.sources(startingOn: candidate.id).contains { source in
-                    source.page == page.id && (request.position.offset.map { NSLocationInRange($0, source.range) }
+                    source.page == page.id && (position.offset.map { NSLocationInRange($0, source.range) }
                         ?? (candidate.id != page.id))
                 }
             }) {
-                return FoldScroll(id: request.id, destination: PDFFoldPosition(page: candidate.id, offset: passage.id))
+                return FoldScroll(id: request.id, destination: .position(PDFFoldPosition(page: candidate.id, offset: passage.id)))
             }
         }
         let body = bodyPassages(on: page, in: chapter)
         if let passage = body.first {
-            return FoldScroll(id: request.id, destination: PDFFoldPosition(page: page.id, offset: passage.id))
+            return FoldScroll(id: request.id, destination: .position(PDFFoldPosition(page: page.id, offset: passage.id)))
         }
-        if !page.footnotes.isEmpty { return FoldScroll(id: request.id, destination: page.footnotePosition) }
-        return FoldScroll(id: request.id, destination: PDFFoldPosition(page: page.id))
+        if !page.footnotes.isEmpty { return FoldScroll(id: request.id, destination: .position(page.footnotePosition)) }
+        if !page.hasSourceText { return FoldScroll(id: request.id, destination: .position(PDFFoldPosition(page: page.id))) }
+        return FoldScroll(id: request.id, destination: .chapter(chapter.id))
     }
 
     private func updateFoldPosition(_ frames: [PDFFoldPosition: CGRect], height: CGFloat) {
@@ -490,10 +619,12 @@ struct PDFReaderView: View {
         let threshold = min(24, height / 4)
         guard let position = frames.filter({ $0.value.maxY > threshold && $0.value.minY < height })
             .min(by: { $0.value.minY < $1.value.minY })?.key,
-              reader.foldPosition != position,
               let page = chapterPages.first(where: { $0.id == position.page }) else { return }
         let passage = page.passages.first { $0.id == position.offset } ?? page.footnotes.first { $0.id == position.offset }
         reader.rememberFoldPosition(position, passage: passage)
+        if let last = chapterPages.last, position.page >= last.id - 1 {
+            loadMorePages()
+        }
     }
 
     private var foldRows: [FoldRow] {
@@ -501,6 +632,8 @@ struct PDFReaderView: View {
         for chapter in chapters {
             rows.append(.chapter(chapter))
             guard expandedSection == chapter.id else { continue }
+            let bounds = chapter.pages(total: reader.document.pageCount)
+            if let first = chapterPages.first, first.id > bounds.lowerBound { rows.append(.earlier(depth: chapter.depth)) }
             for page in chapterPages {
                 let body = bodyPassages(on: page, in: chapter)
                 if foldUnit != .page && !body.isEmpty { rows.append(.page(page.id, depth: chapter.depth)) }
@@ -508,7 +641,13 @@ struct PDFReaderView: View {
                 else { rows += body.map { .passage($0, page: page.id, depth: chapter.depth) } }
                 if !page.footnotes.isEmpty { rows.append(.notes(page, depth: chapter.depth)) }
             }
-            if loadingPages || chapterPages.isEmpty { rows.append(.loading(depth: chapter.depth)) }
+            if foldLoad != nil {
+                rows.append(.loading(depth: chapter.depth))
+            } else if let last = chapterPages.last, last.id + 1 < bounds.upperBound {
+                rows.append(.later(depth: chapter.depth))
+            } else if let end = chapter.end, let next = chapters.first(where: { $0.id != chapter.id && $0.start == end }) {
+                rows.append(.nextChapter(next))
+            }
         }
         return rows
     }
@@ -536,6 +675,12 @@ struct PDFReaderView: View {
         case .passage(let passage, let page, let depth):
             foldedCard(passage, page: page)
                 .contextMenu {
+                    Button("翻译原段") { translatePassage(passage, page: page) }
+                    Button("摘录原段") { excerpt(passage, page: page) }
+                    Button("批注原段…") {
+                        if reader.saveDraft() { beginNote(reader.draftExcerpt(passage, page: page)) }
+                    }
+                    Divider()
                     let position = PDFFoldPosition(page: page, offset: passage.id)
                     let next = nextPassage(after: position)
                     Button("与下一段合并") {
@@ -569,10 +714,22 @@ struct PDFReaderView: View {
                     .modifier(FoldRowPosition(position: PDFFoldPosition(page: page.id)))
             }
         case .loading(let depth):
-            ProgressView("正在读取本段…").controlSize(.small)
+            ProgressView("正在展开原文…").controlSize(.small)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 12)
                 .modifier(FoldMargin(depth: depth))
+        case .earlier(let depth):
+            Button(action: loadPreviousPages) { Label("展开本章前面的页", systemImage: "arrow.up") }
+                .buttonStyle(.borderless).foregroundColor(Palette.green).padding(.vertical, 10)
+                .modifier(FoldMargin(depth: depth)).disabled(foldLoad != nil)
+        case .later(let depth):
+            Button(action: loadMorePages) { Label("展开后面的页", systemImage: "arrow.down") }
+                .buttonStyle(.borderless).foregroundColor(Palette.green).padding(.vertical, 10)
+                .modifier(FoldMargin(depth: depth))
+        case .nextChapter(let chapter):
+            Button { activateChapter(chapter) } label: {
+                Label(foldUnit == .chapter ? "读下一节" : foldUnit == .page ? "读下一页" : "读下一段", systemImage: "arrow.down")
+            }.buttonStyle(.borderless).foregroundColor(Palette.green).padding(.vertical, 10)
         }
     }
 
@@ -636,7 +793,7 @@ struct PDFReaderView: View {
                     store.inspectPDF(reader, at: chapter.start)
                 }.foregroundColor(Palette.muted)
             }
-        }.padding(.leading, CGFloat(min(4, chapter.depth)) * 12)
+        }.padding(.leading, CGFloat(min(7, chapter.depth)) * 10)
             .padding(.vertical, 5)
     }
 
@@ -669,14 +826,14 @@ struct PDFReaderView: View {
         let full = passage.displayText
         let preview = passage.scanExcerpt
         let text = expanded ? full : preview
-        let decorated = !isFootnote && store.library.preferences.readingWordEmphasis == true
-            ? ReadingWordEmphasis.format(text) : AttributedString(text)
+        let mode = isFootnote ? .off : store.library.preferences.readingAid
         let canToggle = !isFootnote && !showFullPassages && preview != full
         let bodySize = reader.isFocused ? layout.textSize : 16
         return HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(decorated).font(.system(size: isFootnote ? max(13, bodySize - 2) : bodySize))
-                    .lineSpacing(isFootnote ? 4 : 6).textSelection(.enabled)
+                foldedText(text, full: full, passage: passage, page: page, mode: mode)
+                    .font(.system(size: isFootnote ? max(13, bodySize - 2) : bodySize))
+                    .lineSpacing(isFootnote ? 4 : reader.isFocused ? layout.paragraphLineSpacing : 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if canToggle {
                     Button {
@@ -691,6 +848,9 @@ struct PDFReaderView: View {
                 }
             }
             HStack(spacing: 0) {
+                ReadingIconButton(title: isFootnote ? "翻译脚注" : "翻译原段", systemImage: "character.bubble") {
+                    translatePassage(passage, page: page)
+                }
                 ReadingIconButton(title: "查原文 · " + reader.pageReference(page), systemImage: "arrow.up.right") {
                     let location = reader.location(of: passage, on: page)
                     store.inspectPDF(reader, at: location, lines: reader.sourceLines(of: passage, page: page),
@@ -705,194 +865,328 @@ struct PDFReaderView: View {
         }.padding(.vertical, 10)
     }
 
-    private func setFoldUnit(_ unit: PDFFoldUnit?, pages: Int? = nil) {
-        if store.commit({
-            $0.preferences.pdfFoldUnit = unit
-            if let pages { $0.preferences.pdfFoldPages = pages }
-        }) {
-            if !reader.savedOutline.isEmpty { documentFoldUnit = unit }
-            readingPageGroup = false
-            resetChapters()
+    @ViewBuilder private func foldedText(_ text: String, full: String, passage: FoldedPDFPassage,
+                                         page: Int, mode: ReadingAidMode) -> some View {
+        let decorated = ReadingWordEmphasis.format(text, mode: mode)
+        if translation.pointMode {
+            let sentences = ReadingSentence.visibleRanges(in: text, from: full)
+            Text(sentenceLinks(in: decorated, text: text, sentences: sentences, passage: passage.id, page: page))
+                .tint(Palette.ink)
+                .environment(\.openURL, OpenURLAction { url in
+                    guard url.scheme == "wander-sentence", let index = Int(url.lastPathComponent), sentences.indices.contains(index) else {
+                        return .discarded
+                    }
+                    translatePassage(passage, page: page, sentence: sentences[index].source)
+                    return .handled
+                })
+        } else {
+            Text(decorated).textSelection(.enabled)
+        }
+    }
+
+    private func sentenceLinks(in decorated: AttributedString, text: String, sentences: [ReadingSentence.VisibleRange],
+                                passage: Int, page: Int) -> AttributedString {
+        var linked = decorated
+        for (index, sentence) in sentences.enumerated() {
+            guard let visible = Range(sentence.visible, in: text), let range = Range(visible, in: linked) else { continue }
+            linked[range].link = URL(string: "wander-sentence://read/\(index)")
+            if case .folded(let markedPage, let markedPassage, let markedRange) = translation.activeSentence,
+               markedPage == page, markedPassage == passage, markedRange == sentence.source {
+                linked[range].foregroundColor = Palette.green
+                linked[range].underlineStyle = .single
+            } else {
+                linked[range].foregroundColor = Palette.ink
+            }
+        }
+        return linked
+    }
+
+    private func setFoldUnit(_ unit: PDFFoldUnit, pages: Int? = nil) {
+        var options = reader.foldOptions
+        options.unit = unit
+        if let pages { options.pages = pages }
+        guard reader.setFoldOptions(options) else { return }
+        beginFolding()
+    }
+
+    private func beginFolding() {
+        if reader.foldOptions.unit == .chapter { reader.prepareOutline() }
+        resetChapters()
+    }
+
+    private func setFoldedView(_ folded: Bool) {
+        setFoldedView(folded, forReadingAid: false)
+    }
+
+    private func setFoldedView(_ folded: Bool, forReadingAid: Bool) {
+        guard folded != reader.showOutline else { return }
+        if folded {
+            let original = reader.location
+            let origin = forReadingAid ? reader.readingAidOrigin() : original
+            reader.showOutline = true
+            if forReadingAid {
+                let position = reader.foldPosition(at: origin)
+                reader.prepareFoldReflow(to: position, returnLocation: original)
+                reader.jumpInFold(to: origin, position: position, preserveReflow: true)
+            }
+        } else {
+            let original = reader.originalLocationForFoldReflow()
+            reader.showOutline = false
+            if let original {
+                reader.go(to: original)
+            } else {
+                reader.showSource(at: reader.location)
+            }
         }
     }
 
     private func resetChapters() {
-        chapters = reader.chapters(unit: foldUnit, groupSize: groupSize, inferred: inferredSections ?? [])
-        openCurrentFold(reload: true)
-    }
-
-    private func openCurrentFold(reload: Bool = false) {
-        let chapter = reader.chapterAt(reader.location, in: chapters)
-        let current = !reader.hasAuthorOutline && chapter?.id == -1 && reader.foldPosition == nil ? nil : chapter
-        if reload || current?.id != expandedSection { expand(current) }
-        guard let current, current.pages(total: reader.document.pageCount).contains(reader.location.page) else { return }
-        if let saved = reader.foldPosition, saved.page == reader.location.page {
-            foldRestore = FoldRestore(position: saved)
-        } else if reader.location.page > current.start.page {
-            foldRestore = FoldRestore(position: PDFFoldPosition(page: reader.location.page))
-        }
+        chapters = reader.chapters(unit: foldUnit, groupSize: groupSize)
+        guard let chapter = reader.chapterAt(reader.location, in: chapters) else { expand(nil); return }
+        let anchor = reader.foldPosition ?? (reader.location.point != nil || reader.location.page > chapter.start.page
+            ? reader.foldPosition(at: reader.location) : nil)
+        expand(chapter, position: anchor)
     }
 
     private func toggleChapter(_ chapter: PDFChapter) {
-        if findingOutline { readingPageGroup = true }
-        expand(expandedSection == chapter.id ? nil : chapter)
+        if expandedSection == chapter.id { expand(nil) }
+        else { activateChapter(chapter) }
     }
 
-    private func expand(_ chapter: PDFChapter?) {
+    private func activateChapter(_ chapter: PDFChapter) {
+        reader.jumpInFold(to: chapter.start, position: nil)
+        expand(chapter, scrollToHeading: true)
+    }
+
+    private func expand(_ chapter: PDFChapter?, position: PDFFoldPosition? = nil, scrollToHeading: Bool = false) {
         expandedSection = chapter?.id
-        foldRestore = nil
+        foldRestore = position != nil || scrollToHeading ? FoldRestore(position: position) : nil
         sourceChapterPages = []
         chapterPages = []
         openedPassages = []
-        loadingPages = chapter != nil
-        loadKey = UUID()
+        foldLoad = chapter.map {
+            FoldLoad(chapterID: $0.id, pages: $0.initialPages(around: position?.page ?? $0.start.page,
+                                                            total: reader.document.pageCount))
+        }
+    }
+
+    private func loadMorePages() {
+        guard foldLoad == nil, let chapter = expandedChapter, let last = chapterPages.last else { return }
+        let start = last.id + 1
+        let end = chapter.pages(total: reader.document.pageCount).upperBound
+        guard start < end else { return }
+        foldLoad = FoldLoad(chapterID: chapter.id, pages: start..<min(end, start + PDFChapter.batchSize))
+    }
+
+    private func loadPreviousPages() {
+        guard foldLoad == nil, let chapter = expandedChapter, let first = chapterPages.first,
+              first.id > chapter.start.page else { return }
+        let start = max(chapter.start.page, first.id - PDFChapter.batchSize)
+        foldLoad = FoldLoad(chapterID: chapter.id, pages: start..<first.id,
+                            restore: reader.foldPosition ?? reader.foldPosition(at: reader.location))
+    }
+
+    private func openNavigation() {
+        navigationPresented.toggle()
+        if navigationPresented { reader.prepareOutline() }
+    }
+
+    private func openOutlineEditor(reviewPending: Bool) {
+        navigationPresented = false
+        DispatchQueue.main.async { outlineEditor = OutlineSheet(reviewPending: reviewPending) }
+    }
+
+    private func goToSection(_ section: PDFReadingSection) {
+        let target = reader.sectionLocation(section)
+        if reader.showOutline, foldUnit == .chapter, let chapter = chapters.first(where: { $0.id == section.id }) {
+            navigationPresented = false
+            activateChapter(chapter)
+        } else {
+            goToReadingLocation(target)
+        }
+    }
+
+    private func goToPage(_ page: Int) {
+        goToReadingLocation(PDFReadingLocation(page: page))
+    }
+
+    private func goToBookmark(_ bookmark: PDFPlaceBookmark) {
+        guard bookmark.revision == reader.revision else { return }
+        goToReadingLocation(bookmark.location, position: bookmark.foldPosition)
+    }
+
+    private func goToReadingLocation(_ location: PDFReadingLocation, position: PDFFoldPosition? = nil) {
+        navigationPresented = false
+        guard reader.showOutline else { reader.showSource(at: location); return }
+        let anchor = position ?? reader.foldPosition(at: location)
+        reader.jumpInFold(to: location, position: anchor)
+        guard let chapter = reader.chapterAt(location, in: chapters) else { return }
+        if expandedSection == chapter.id && chapterPages.contains(where: { $0.id == anchor.page }) {
+            foldRestore = FoldRestore(position: anchor)
+        } else {
+            expand(chapter, position: anchor)
+        }
+    }
+
+    private func toggleBookmark() {
+        let outline = reader.navigationSections
+        let current = reader.currentSectionID(in: outline)
+        let title = outline.first(where: { $0.id == current })?.title
+            ?? "第 \(reader.location.page + 1) 页"
+        reader.toggleBookmark(title: title)
     }
 
     private var notePanel: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    if let draft = reader.noteDraft {
-                        Text(reader.editingNote ? "编辑笔记" : draft.kind == .detour ? "先放这里" : "留一句想法")
-                            .font(.system(size: 22, weight: .medium, design: .serif))
-                        if let data = draft.scan?.jpeg, let image = NSImage(data: data) {
-                            Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 120).accessibilityLabel("框选原图")
+        let visible = visibleMarks
+        let sent = store.deliveredNotes(for: reader.itemID)
+        return VStack(spacing: 0) {
+            ReadingNotesHeader(total: reader.marks.count, visible: visible.count, selecting: selectingNotes,
+                               canFilterExcerpts: true, filter: $noteFilter, toggleSelection: {
+                selectingNotes.toggle()
+                selectedNotes = []
+            }, close: {
+                if reader.saveDraft() { setNotebook(false) }
+            })
+            if selectingNotes && !visible.isEmpty {
+                NotebookBatchControls(visible: Set(visible.map(\.id)), sent: sent, sending: transfer.sending, selected: $selectedNotes,
+                                      send: send, remove: { reader.saveDraft() && reader.remove($0) })
+                    .padding([.horizontal, .bottom], 9)
+            }
+            NotebookDeliveryStatus(transfer: transfer, store: store, itemID: reader.itemID)
+                .padding(.horizontal, 9)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 7) {
+                        if let draft = reader.noteDraft, !reader.editingNote {
+                            noteCard(draft, sent: false, draft: true).id(draft.id)
                         }
-                        if !draft.quote.isEmpty { quote(draft.quote) }
-                        TextField(draft.kind == .detour ? "想查什么？也可以贴网址" : "你的想法", text: $reader.draftText, axis: .vertical)
-                            .lineLimit(3...8)
-                            .textFieldStyle(.roundedBorder)
-                            .focused($noteFocused)
-                            .accessibilityLabel("笔记内容")
-                        HStack {
-                            Button("取消", action: reader.discardDraft)
-                                .keyboardShortcut(.cancelAction)
-                            Spacer()
-                            Button("保存") { _ = reader.saveDraft() }
-                                .keyboardShortcut(.defaultAction)
-                                .buttonStyle(.borderedProminent)
-                                .disabled(draft.kind == .detour && reader.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && draft.quote.isEmpty)
+                        if visible.isEmpty && reader.noteDraft == nil {
+                            Text(noteFilter.isFiltering ? "没有找到符合条件的笔记。" : "选中文字可摘录或写批注。扫描页也可以框选。")
+                                .font(.system(size: 12)).foregroundColor(Palette.muted)
+                                .padding(.horizontal, 7).padding(.vertical, 12)
                         }
-                        Divider()
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("这一篇的笔记").font(.system(size: 21, weight: .medium, design: .serif))
-                            Spacer()
-                            if !reader.marks.isEmpty {
-                                Button(selectingNotes ? "完成" : "批量") {
-                                    selectingNotes.toggle()
-                                    selectedNotes = []
-                                }.buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.green)
-                            }
-                        }
-                        NotebookDeliveryStatus(transfer: transfer) { store.openNotebook(reader.itemID) }
-                        if reader.marks.isEmpty {
-                            Text("划下想留下的一句，或把读到一半冒出来的念头暂放在这里。")
-                                .font(.system(size: 13))
-                                .foregroundColor(Palette.muted)
-                                .lineSpacing(4)
-                        }
-                    }
-                    ReadingRelatedSidebar(search: relatedSearch, store: store, itemID: reader.itemID,
-                                          suggestedQuery: reader.intent, keep: keepRelated)
-                        .id("reading-related")
-                    if !reader.marks.isEmpty {
-                        Picker("笔记范围", selection: $excerptsOnly) { Text("全部").tag(false); Text("摘录").tag(true) }
-                            .pickerStyle(.segmented).labelsHidden()
-                    }
-                    if selectingNotes && !visibleMarks.isEmpty {
-                        NotebookBatchControls(visible: Set(visibleMarks.map(\.id)), selected: $selectedNotes,
-                                              send: send, remove: { reader.saveDraft() && reader.remove($0) })
-                    }
-                    let sent = store.deliveredNotes(for: reader.itemID)
-                    ForEach(visibleMarks) { mark in noteCard(mark, sent: sent.contains(mark.id)).id(mark.id) }
+                        ForEach(visible) { mark in noteCard(mark, sent: sent.contains(mark.id)).id(mark.id) }
+                        ReadingRelatedSidebar(search: relatedSearch, store: store, itemID: reader.itemID,
+                                              suggestedQuery: reader.intent, keep: keepRelated)
+                            .id("reading-related")
+                    }.padding(9)
                 }
-                .padding(20)
+                .onAppear { if let id = reader.revealedNote { proxy.scrollTo(id, anchor: .top) } }
+                .onChange(of: reader.revealedNote) { id in
+                    if let id { DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) } }
+                }
+                .onChange(of: reader.noteDraft?.id) { id in
+                    if let id { DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) } }
+                }
+                .onChange(of: relatedSearch.requestID) { _ in
+                    DispatchQueue.main.async { proxy.scrollTo("reading-related", anchor: .top) }
+                }
             }
-            .onAppear {
-                if let id = reader.revealedNote { proxy.scrollTo(id, anchor: .top) }
-            }
-            .onChange(of: reader.revealedNote) { id in
-                if let id = id { proxy.scrollTo(id, anchor: .top) }
-            }
-            .onChange(of: relatedSearch.requestID) { _ in proxy.scrollTo("reading-related", anchor: .top) }
         }
-        .background(reader.isFocused ? layout.notes : Palette.side)
+        .background(reader.isFocused ? layout.notes : Palette.paper)
     }
 
-    private func quote(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 13, design: .serif))
-            .foregroundColor(Palette.muted)
-            .lineSpacing(4)
-            .textSelection(.enabled)
+    private func notePlace(_ mark: PDFReadingMark) -> String {
+        if mark.revision != reader.revision { return "旧版 · " + ReaderNote(mark).location }
+        if mark.lines.contains(where: { $0.page != mark.location.page }) { return ReaderNote(mark).location }
+        return reader.pageReference(mark.location.page)
     }
 
-    private func noteCard(_ mark: PDFReadingMark, sent: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                if selectingNotes { NotebookSelectionToggle(id: mark.id, selected: $selectedNotes) }
-                if !mark.lines.isEmpty {
-                    Circle().fill(Color((mark.color ?? .yellow).color)).frame(width: 8, height: 8)
-                        .accessibilityLabel((mark.color ?? .yellow).title)
-                }
-                Text(mark.scan != nil ? "图摘" : mark.isExcerpt == true ? "摘录" : mark.kind == .detour ? "暂放" : mark.lines.isEmpty ? "页边记" : "批注")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(Palette.green)
-                Spacer()
-                Text(mark.revision == reader.revision ? reader.pageReference(mark.location.page) : "旧版本 · 待定位")
-                    .font(.system(size: 11))
-                    .foregroundColor(Palette.muted)
+    private func noteCard(_ mark: PDFReadingMark, sent: Bool, draft: Bool = false) -> some View {
+        let editing = reader.noteDraft?.id == mark.id
+        let color = mark.lines.isEmpty ? nil : mark.appearance.color
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                if selectingNotes && !draft { NotebookSelectionToggle(id: mark.id, selected: $selectedNotes) }
+                Text(draft ? "新批注" : ReaderNote(mark).kind)
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer(minLength: 3)
+                Text(notePlace(mark)).font(.system(size: 11)).foregroundColor(Palette.muted)
+                    .monospacedDigit().lineLimit(1)
             }
             if let data = mark.scan?.jpeg, let image = NSImage(data: data) {
-                Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 135)
-                    .clipShape(RoundedRectangle(cornerRadius: 5)).accessibilityLabel("框选原图")
+                Image(nsImage: image).resizable().scaledToFit().frame(maxHeight: 145)
+                    .clipShape(RoundedRectangle(cornerRadius: 6)).accessibilityLabel("框选原图")
                 Button(mark.quote.isEmpty ? "识别文字" : "校对文字") {
                     if reader.saveDraft() { scanEditor = ScanEditorID(id: mark.id) }
-                }.buttonStyle(.plain).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.green)
+                }.buttonStyle(ReadingControlStyle())
             }
-            if !mark.note.isEmpty { Text(mark.note).font(.system(size: 14)).textSelection(.enabled) }
-            if !mark.quote.isEmpty { quote(mark.quote).lineLimit(4) }
-            HStack {
-                if mark.revision == reader.revision {
-                    Button("查原文") {
-                        store.inspectPDF(reader, at: mark.location, lines: mark.lines, note: mark.id, quote: mark.quote)
-                    }
-                } else if mark.scan == nil {
-                    Button(mark.quote.isEmpty ? "定位到此页" : "用选中文字定位") { relocate(mark) }
-                        .disabled(reader.showOutline || (!mark.quote.isEmpty && !reader.hasSelection))
+            if !mark.quote.isEmpty { ReadingNoteQuote(text: mark.quote, color: color, editing: editing) }
+            if mark.needsQuoteReview && !draft {
+                Button { repairQuote(mark) } label: {
+                    Label("文字可能有错码 · 从原页校对", systemImage: "text.magnifyingglass")
+                        .font(.system(size: 11))
+                }.buttonStyle(ReadingControlStyle(accented: true))
+                    .help("PDF 的显示字形可能与内部文字编码不一致。可以从选区原图重新识别。")
+            }
+            if editing {
+                ReadingNoteComposer(prompt: mark.kind == .detour ? "想查什么？也可以贴网址" : "写下你的想法…",
+                                    text: $reader.draftText, cancel: reader.discardDraft, save: { _ = reader.saveDraft() })
+            } else {
+                if !mark.note.isEmpty {
+                    Text(mark.note).font(.system(size: 13)).lineSpacing(3).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer()
-                NotebookSendButton(sent: sent) { if sent { store.openNotebook(reader.itemID, noteID: mark.id) } else { send([mark.id]) } }
-                if mark.isExcerpt == true {
-                    Button { copy(mark) } label: { Image(systemName: highlightCopied == mark.id ? "checkmark" : "doc.on.doc") }
-                        .accessibilityLabel("复制摘录与出处").help("复制摘录与出处")
-                }
-                Menu {
-                    Button("编辑想法") { edit(mark) }
-                    Button("Obsidian 收件与模板…", action: transfer.openSetup)
-                    if !mark.lines.isEmpty {
-                        Menu("划线颜色") {
-                            ForEach(PDFMarkColor.allCases, id: \.self) { color in
-                                Button(color.title) { reader.setColor(color, for: mark) }
-                            }
+                noteActions(mark, sent: sent)
+            }
+        }
+        .readingNoteRow(active: reader.revealedNote == mark.id || editing)
+    }
+
+    private func noteActions(_ mark: PDFReadingMark, sent: Bool) -> some View {
+        HStack(spacing: 1) {
+            if mark.revision == reader.revision {
+                Button {
+                    store.inspectPDF(reader, at: mark.location, lines: mark.lines, note: mark.id, quote: mark.quote,
+                                     isRegion: mark.scan != nil)
+                } label: { Label("查原文", systemImage: "arrow.up.right") }
+                    .buttonStyle(ReadingControlStyle())
+            } else if mark.scan == nil {
+                Button(mark.quote.isEmpty ? "定位到此页" : "重新定位") { relocate(mark) }
+                    .buttonStyle(ReadingControlStyle())
+                    .help("在新版 PDF 选中相同的原文后更新出处")
+                    .disabled(reader.showOutline || (!mark.quote.isEmpty && !reader.hasSelection))
+            }
+            Spacer(minLength: 0)
+            ReadingIconButton(title: mark.note.isEmpty ? "写想法" : "编辑想法", systemImage: "square.and.pencil") { edit(mark) }
+            ReadingIconButton(title: highlightCopied == mark.id ? "已复制" : "复制摘录与出处",
+                              systemImage: highlightCopied == mark.id ? "checkmark" : "doc.on.doc") { copy(mark) }
+            NotebookSendButton(sent: sent) { if sent { store.openNotebook(reader.itemID, noteID: mark.id) } else { send([mark.id]) } }
+                .disabled(transfer.sending && !sent)
+            Menu {
+                if !mark.quote.isEmpty && mark.scan == nil {
+                    Button("校对摘录文字…") { repairQuote(mark) }
+                    if mark.quoteCorrection != nil {
+                        Button("恢复原提取文字") {
+                            if reader.saveDraft() { _ = reader.restoreOriginalQuote(mark.id) }
                         }
                     }
-                    Button(highlightCopied == mark.id ? "已复制" : "复制笔记") { copy(mark) }
-                    Button("移除", role: .destructive) { reader.remove(mark.id) }
-                } label: { Image(systemName: "ellipsis") }
-                .menuStyle(.borderlessButton)
-                .frame(width: 26)
-                .accessibilityLabel("管理这条笔记")
-            }
-            .font(.system(size: 12))
-            .buttonStyle(.plain)
-            .foregroundColor(Palette.green)
-        }
-        .padding(12)
-        .background(reader.revealedNote == mark.id ? Palette.surface : Palette.card)
-        .cornerRadius(8)
+                    Divider()
+                }
+                if !mark.quote.isEmpty {
+                    Button("翻译摘录") {
+                        let request = TranslationPassage(text: mark.quote, title: reader.title, place: notePlace(mark),
+                            document: TranslationDocument(itemID: reader.itemID, revision: mark.revision),
+                            suspectedEncodingError: mark.needsQuoteReview)
+                        translation.show(request, settings: translationSettings, archive: store.translations)
+                    }
+                }
+                if !mark.lines.isEmpty {
+                    ReadingNoteAppearanceMenu(appearance: mark.appearance, styles: mark.scan == nil,
+                                              changeColor: { reader.setColor($0, for: mark) },
+                                              changeStyle: { reader.setStyle($0, for: mark) })
+                    Divider()
+                }
+                Button("文献引文键…") { transfer.editingCitation = true }
+                Button("Obsidian 收件设置…", action: transfer.openSetup)
+                Button("移除", role: .destructive) {
+                    if reader.saveDraft() { reader.remove(mark.id) }
+                }
+            } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                .frame(width: 28).accessibilityLabel("管理这条笔记")
+        }.foregroundColor(Palette.muted)
     }
 
     private var validPageEntry: Bool {
@@ -915,35 +1209,46 @@ struct PDFReaderView: View {
     }
 
     private func setNotebook(_ visible: Bool) {
-        guard notebook != visible else { return }
-        let position = reader.location
-        notebook = visible
+        if notebooks[focused: reader.isFocused] != visible { preserveFoldPosition() }
+        notebooks[focused: reader.isFocused] = visible
         if !visible { reader.revealedNote = nil }
-        if !reader.showOutline {
-            DispatchQueue.main.async { if !reader.showOutline { reader.go(to: position) } }
+    }
+
+    private func preserveFoldPosition() {
+        if reader.showOutline, let anchor = reader.foldPosition, expandedChapter != nil {
+            foldRestore = FoldRestore(position: anchor)
         }
     }
 
     private func capture(_ kind: PDFReadingMark.Kind, edit: Bool, pageOnly: Bool = false) {
         guard reader.saveDraft() else { return }
         do {
-            let mark = try reader.draft(kind: kind, pageOnly: pageOnly)
-            if edit {
-                reader.noteDraft = mark
-                reader.draftText = ""
-                reader.editingNote = false
-                setNotebook(true)
-                noteFocused = true
-            } else { _ = reader.save(mark) }
+            let mark = try reader.draft(kind: kind, pageOnly: pageOnly || reader.showOutline)
+            if edit { beginNote(mark) }
+            else if reader.save(mark) {
+                reader.clearSelection()
+                if mark.needsQuoteReview { repairQuote(mark) }
+            }
         } catch { store.error = error.localizedDescription }
     }
 
-    private func excerpt(_ passage: FoldedPDFPassage? = nil, page: Int? = nil) {
+    private func beginNote(_ mark: PDFReadingMark) {
+        reader.noteDraft = mark
+        reader.draftText = mark.note
+        reader.editingNote = reader.marks.contains(where: { $0.id == mark.id })
+        reader.revealedNote = mark.id
+        reader.clearSelection()
+        setNotebook(true)
+    }
+
+    private func excerpt(_ passage: FoldedPDFPassage? = nil, page: Int? = nil, appearance: ReadingMarkAppearance? = nil) {
         guard reader.saveDraft() else { return }
         do {
-            if let mark = try reader.excerpt(passage, page: page) {
+            if let mark = try reader.excerpt(passage, page: page, appearance: appearance) {
+                reader.clearSelection()
                 if notebook { revealExcerpt(mark.id) }
                 else { justExcerpted = mark.id }
+                if mark.needsQuoteReview { repairQuote(mark) }
             }
         } catch { store.error = error.localizedDescription }
     }
@@ -951,9 +1256,38 @@ struct PDFReaderView: View {
     private func revealExcerpt(_ id: UUID) {
         justExcerpted = nil
         guard reader.marks.contains(where: { $0.id == id }) else { return }
-        excerptsOnly = false
+        if let mark = reader.marks.first(where: { $0.id == id }) { includeInNotes(mark) }
         setNotebook(true)
         reader.revealedNote = id
+    }
+
+    private func repairQuote(_ mark: PDFReadingMark) {
+        if reader.saveDraft() { quoteEditor = ScanEditorID(id: mark.id) }
+    }
+
+    private func includeInNotes(_ mark: PDFReadingMark) {
+        guard noteFilter.isFiltering else { return }
+        noteFilter = noteFilter.including(color: mark.lines.isEmpty ? nil : mark.appearance.color,
+                                         isExcerpt: mark.isExcerpt == true,
+                                         text: [mark.quote, mark.note, notePlace(mark), ReaderNote(mark).kind])
+    }
+
+    private func setMarkStyle(_ style: ReadingMarkStyle) {
+        var appearance = markAppearance
+        appearance.style = style
+        store.commit { $0.preferences.readingMarkAppearance = appearance }
+    }
+
+    private func copySelection() {
+        guard let quote = reader.selectedQuote else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(quote, forType: .string)
+    }
+
+    private func searchSelection() {
+        guard let quote = reader.selectedQuote else { return }
+        searchRelated(quote)
+        reader.clearSelection()
     }
 
     private func searchRelated(_ quote: String) {
@@ -976,10 +1310,7 @@ struct PDFReaderView: View {
 
     private func edit(_ mark: PDFReadingMark) {
         guard reader.saveDraft() else { return }
-        reader.noteDraft = mark
-        reader.draftText = mark.note
-        reader.editingNote = true
-        noteFocused = true
+        beginNote(mark)
     }
 
     private func leave() {
@@ -992,12 +1323,16 @@ struct PDFReaderView: View {
     }
 
     private func send(_ ids: Set<UUID>) {
+        if let mark = reader.marks.first(where: { ids.contains($0.id) && $0.needsQuoteReview }) {
+            repairQuote(mark)
+            return
+        }
         if reader.saveDraft() { transfer.send(ids, from: reader.itemID, store: store) }
     }
 
     private func copy(_ mark: PDFReadingMark) {
-        let place = mark.revision == reader.revision ? reader.pageReference(mark.location.page) : "旧版 PDF 第 \(mark.location.page + 1) 页"
-        let text = [reader.title + " · " + place, mark.quote, mark.note].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        if mark.needsQuoteReview { repairQuote(mark); return }
+        let text = [reader.title + " · " + notePlace(mark), mark.quote, mark.note].filter { !$0.isEmpty }.joined(separator: "\n\n")
         let board = NSPasteboard.general
         board.clearContents()
         if let jpeg = mark.scan?.jpeg {
@@ -1044,6 +1379,10 @@ private struct FoldRowPosition: ViewModifier {
 struct PDFCanvas: NSViewRepresentable {
     @ObservedObject var reader: PDFReader
     var background = Palette.side
+    var layoutWidth: Double
+    var notebook: Bool
+    var sentence: PDFSentenceHit? = nil
+    var pointTranslate: ((PDFSentenceHit, Bool) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(reader: reader) }
 
@@ -1061,11 +1400,16 @@ struct PDFCanvas: NSViewRepresentable {
             reader?.restoreAfterLayout(in: view)
         }
         let surface = PDFReadingSurface(pdf: view, reader: reader)
+        context.coordinator.pointTranslate = pointTranslate
         context.coordinator.observe(view, highlights: surface.highlights)
+        view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.selectionTracker?.refresh() }
         return surface
     }
 
     func updateNSView(_ view: PDFReadingSurface, context: Context) {
+        context.coordinator.pointTranslate = pointTranslate
+        (view.pdf as? LaidOutPDFView)?.showSentence(sentence)
+        context.coordinator.layoutChanged(width: layoutWidth, notebook: notebook, in: view.pdf)
         view.pdf.backgroundColor = NSColor(background)
         view.highlights.needsDisplay = true
         view.regionOverlay.refresh()
@@ -1078,20 +1422,44 @@ struct PDFCanvas: NSViewRepresentable {
     final class Coordinator: NSObject {
         private weak var reader: PDFReader?
         private var observers: [NSObjectProtocol] = []
+        fileprivate var selectionTracker: ReadingSelectionTracker?
+        private var lastWidth: Double?
+        private var lastNotebook: Bool?
+        var pointTranslate: ((PDFSentenceHit, Bool) -> Void)?
 
         init(reader: PDFReader) { self.reader = reader }
 
+        func layoutChanged(width: Double, notebook: Bool, in view: PDFView) {
+            let changed = lastWidth != nil && (lastWidth != width || lastNotebook != notebook)
+            lastWidth = width
+            lastNotebook = notebook
+            if changed { reader?.preserveCanvasReadingPosition(in: view) }
+        }
+
         func observe(_ view: PDFView, highlights: NSView) {
+            selectionTracker = ReadingSelectionTracker(locate: { [weak self, weak view] in
+                guard let view, let reader = self?.reader, reader.hasSelection, !reader.showOutline,
+                      !reader.selectingRegion, let selection = view.currentSelection else { return nil }
+                let rect = view.visiblePages.reduce(CGRect.null) { bounds, page in
+                    let pageRect = selection.bounds(for: page)
+                    return pageRect.isEmpty ? bounds : bounds.union(view.convert(pageRect, from: page))
+                }
+                return ReadingSelectionTracker.anchor(rect, in: view)
+            }, show: { [weak reader] rect in
+                if let reader, reader.selectionAnchor != rect { reader.selectionAnchor = rect }
+            })
             let click = NSClickGestureRecognizer(target: self, action: #selector(revealClickedMark(_:)))
             click.delaysPrimaryMouseButtonEvents = false
             view.addGestureRecognizer(click)
             let center = NotificationCenter.default
             observers.append(center.addObserver(forName: .PDFViewSelectionChanged, object: view, queue: .main) { [weak self] _ in
                 self?.reader?.selectionChanged()
+                self?.selectionTracker?.refresh()
             })
             for name in [Notification.Name.PDFViewPageChanged, .PDFViewVisiblePagesChanged, .PDFViewScaleChanged] {
                 observers.append(center.addObserver(forName: name, object: view, queue: .main) { [weak self, weak highlights] _ in
                     self?.reader?.visiblePositionChanged()
+                    self?.selectionTracker?.refresh()
                     highlights?.needsDisplay = true
                 })
             }
@@ -1099,30 +1467,51 @@ struct PDFCanvas: NSViewRepresentable {
                 clip.postsBoundsChangedNotifications = true
                 observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self, weak highlights] _ in
                     self?.reader?.visiblePositionChanged()
+                    self?.selectionTracker?.refresh()
                     highlights?.needsDisplay = true
                 })
             }
         }
 
         @objc private func revealClickedMark(_ gesture: NSClickGestureRecognizer) {
-            guard let view = gesture.view as? PDFView else { return }
-            reader?.revealAnnotation(at: gesture.location(in: view), in: view)
+            guard let view = gesture.view as? LaidOutPDFView, let reader, !reader.showOutline, !reader.selectingRegion else { return }
+            let point = gesture.location(in: view)
+            if let pointTranslate {
+                if let hit = view.sentence(at: point) { pointTranslate(hit, point.x > view.bounds.midX) }
+            } else { reader.revealAnnotation(at: point, in: view) }
         }
 
         func stop() {
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
+            selectionTracker = nil
         }
 
         deinit { stop() }
     }
 }
 
-private final class LaidOutPDFView: PDFView {
+final class LaidOutPDFView: PDFView {
     var onFirstLayout: (() -> Void)?
+    var onLayout: (() -> Void)?
+    private var visibleSentence: UUID?
+
+    func sentence(at point: CGPoint) -> PDFSentenceHit? {
+        guard let page = page(for: point, nearest: false) else { return nil }
+        return page.sentence(at: convert(point, to: page))
+    }
+
+    func showSentence(_ hit: PDFSentenceHit?) {
+        guard visibleSentence != hit?.id else { return }
+        visibleSentence = hit?.id
+        let color = NSColor(Palette.green).withAlphaComponent(0.26)
+        hit?.selections.forEach { $0.color = color }
+        highlightedSelections = hit?.selections
+    }
 
     override func layout() {
         super.layout()
+        onLayout?()
         guard window != nil, bounds.width > 0, bounds.height > 0, let ready = onFirstLayout else { return }
         onFirstLayout = nil
         DispatchQueue.main.async(execute: ready)
@@ -1137,7 +1526,11 @@ final class PDFReadingSurface: NSView {
 
     init(pdf: PDFView, reader: PDFReader) {
         self.pdf = pdf
-        highlights = PDFHighlightSurface(pdf: pdf, reader: reader)
+        highlights = PDFHighlightSurface(pdf: pdf) { [weak reader] view in
+            reader?.highlights(in: view).map {
+                PDFCanvasHighlight(rect: $0.rect, appearance: $0.mark.appearance, isRegion: $0.mark.scan != nil)
+            } ?? []
+        }
         regionOverlay = PDFRegionOverlay(pdf: pdf, reader: reader)
         super.init(frame: .zero)
         addSubview(pdf)
@@ -1157,13 +1550,19 @@ final class PDFReadingSurface: NSView {
     required init?(coder: NSCoder) { nil }
 }
 
-private final class PDFHighlightSurface: NSView {
-    private weak var pdf: PDFView?
-    private weak var reader: PDFReader?
+struct PDFCanvasHighlight {
+    let rect: CGRect
+    var appearance = ReadingMarkAppearance()
+    var isRegion = false
+}
 
-    init(pdf: PDFView, reader: PDFReader) {
+final class PDFHighlightSurface: NSView {
+    private weak var pdf: PDFView?
+    private let marks: (PDFView) -> [PDFCanvasHighlight]
+
+    init(pdf: PDFView, marks: @escaping (PDFView) -> [PDFCanvasHighlight]) {
         self.pdf = pdf
-        self.reader = reader
+        self.marks = marks
         super.init(frame: .zero)
     }
 
@@ -1172,20 +1571,29 @@ private final class PDFHighlightSurface: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let pdf = pdf, let reader = reader, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let pdf, let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState()
         context.clip(to: bounds)
         context.setBlendMode(.multiply)
-        for highlight in reader.highlights(in: pdf) {
+        for highlight in marks(pdf) {
             let frame = convert(highlight.rect, from: pdf)
-            let color = (highlight.mark.color ?? .yellow).color
-            if highlight.mark.scan == nil {
-                context.setFillColor(color.withAlphaComponent(0.40).cgColor)
-                context.fill(frame)
-            } else {
+            let appearance = highlight.appearance
+            let color = appearance.color.color
+            if highlight.isRegion {
                 context.setStrokeColor(color.withAlphaComponent(0.9).cgColor)
                 context.setLineWidth(2)
                 context.stroke(frame.insetBy(dx: 1, dy: 1))
+            } else if appearance.style == .underline {
+                context.setStrokeColor(appearance.color.underlineColor(onDark: false).cgColor)
+                context.setLineWidth(1.7)
+                context.setLineCap(.round)
+                let y = frame.minY + 1
+                context.move(to: CGPoint(x: frame.minX, y: y))
+                context.addLine(to: CGPoint(x: frame.maxX, y: y))
+                context.strokePath()
+            } else {
+                context.setFillColor(color.withAlphaComponent(0.34).cgColor)
+                context.fill(frame)
             }
         }
         context.restoreGState()

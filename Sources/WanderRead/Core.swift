@@ -34,6 +34,7 @@ struct ReadingItem: Identifiable, Codable, Equatable {
     var pdfReading: PDFReadingState?
     var textReading: TextReadingState?
     var zotero: ZoteroReference?
+    var citationKey: String?
     var notebookDeliveries: [NotebookDelivery]?
     var canReadInside: Bool { canSendToResearch || zotero?.pdfKey != nil || ReadingFile.textCandidate(target) }
     var canSendToResearch:Bool {
@@ -84,11 +85,15 @@ struct Preferences: Codable {
     var shareProfile:ShareProfile?
     var appTheme:String?
     var readingWordEmphasis: Bool?
+    var readingAidMode: ReadingAidMode?
+    var readingMarkAppearance: ReadingMarkAppearance?
     var focusLayout: FocusLayout?
     var pdfFoldUnit: PDFFoldUnit?
     var pdfFoldPages: Int?
     var glance: GlancePreferences?
     var notebookExport: NotebookExportSettings?
+    var translation: ReadingTranslationSettings?
+    var lastZoteroImport: ZoteroImportScope?
     var energy = Energy.steady
     var slice = 15
     var exploration = 0.35
@@ -97,6 +102,7 @@ struct Preferences: Codable {
     var metrics: [MetricDefinition]?
     var strategies: [ReadingStrategy]?
     var strategyID: String?
+    var readingAid: ReadingAidMode { readingAidMode ?? (readingWordEmphasis == true ? .adaptive : .off) }
     var metricDefinitions: [MetricDefinition] { metrics ?? MetricDefinition.defaults }
     var allStrategies: [ReadingStrategy] { strategies ?? ReadingStrategy.defaults }
     var strategy: ReadingStrategy { allStrategies.first(where:{$0.id == strategyID}) ?? allStrategies[0] }
@@ -121,6 +127,20 @@ enum InputError: LocalizedError {
 }
 enum Targets {
     static let schemes = Set(["https", "http", "file", "obsidian", "zotero", "siyuan", "x-devonthink-item", "marginnote3app"])
+    static func suggestedTitle(_ value: String) -> String? {
+        guard let target = try? normalize(value) else { return nil }
+        if target.hasPrefix("/") {
+            return URL(fileURLWithPath: target).deletingPathExtension().lastPathComponent
+        }
+        guard let url = URL(string: target) else { return nil }
+        if url.scheme == "obsidian", let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let note = components.queryItems?.first(where: { $0.name == "path" || $0.name == "file" })?.value,
+           !note.isEmpty {
+            return URL(fileURLWithPath: note).deletingPathExtension().lastPathComponent
+        }
+        return url.host ?? url.scheme
+    }
+
     static func normalize(_ value: String) throws -> String {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasPrefix("/") { return URL(fileURLWithPath: text).standardizedFileURL.path }
