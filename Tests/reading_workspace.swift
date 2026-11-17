@@ -31,13 +31,18 @@ func runReadingWorkspaceChecks() throws {
     let reader = TextReader(item: item, url: md, document: document, store: store, focused: true)
     reader.selection = range
     reader.offset = range.location
-    let excerpt = reader.capture()!
+    check(reader.startAnnotation()?.quote == quote && reader.excerpts.isEmpty, "新建文本批注在保存前保留在草稿")
+    reader.discardDraft()
+    check(reader.editing == nil && reader.pendingExcerpt == nil && reader.excerpts.isEmpty, "取消新批注不会留下多余摘录")
+    let appearance = ReadingMarkAppearance(color: .blue, style: .underline)
+    let excerpt = reader.capture(appearance: appearance)!
     check(reader.capture()?.id == excerpt.id && reader.excerpts.count == 1, "同一段重复摘录复用原记录")
     reader.editing = excerpt.id
     reader.draft = "这一句值得回看"
     check(reader.saveDraft() && reader.excerpts[0].note == "这一句值得回看", "摘录的想法可保存")
     reader.remove(excerpt.id); reader.undo()
-    check(reader.excerpts.first?.id == excerpt.id, "误移除的摘录可撤销")
+    check(reader.excerpts.first?.id == excerpt.id && reader.excerpts.first?.appearance == appearance,
+          "误移除的文本摘录可撤销并恢复标记样式")
     store.textReader = reader
     store.leaveReader()
     let loaded = ReadingStore(directory: root, refreshOnLoad: false)
@@ -54,8 +59,8 @@ func runReadingWorkspaceChecks() throws {
      {"key":"CHILD001","data":{"name":"论文","parentCollection":"PARENT01"}}]
     """.utf8))
     let rows = try decoder.decode([ZoteroRow].self, from: Data("""
-    [{"key":"PAPER001","data":{"itemType":"journalArticle","title":"论文","collections":["CHILD001"],"date":"2021-01","creators":[{"lastName":"作者"}],"tags":[{"tag":"专题"}]}},
-     {"key":"BOOK0001","data":{"itemType":"book","title":"书","collections":["PARENT01"]}},
+    [{"key":"PAPER001","data":{"itemType":"journalArticle","title":"论文","citationKey":"author2021","collections":["CHILD001"],"date":"2021-01","creators":[{"lastName":"作者"}],"tags":[{"tag":"专题"}]}},
+     {"key":"BOOK0001","data":{"itemType":"book","title":"书","extra":"Citation Key: shu2020","collections":["PARENT01"]}},
      {"key":"NOTE0001","data":{"itemType":"note","title":"随笔"}}]
     """.utf8))
     let attachments = try decoder.decode([ZoteroRow].self, from: Data("""
@@ -65,10 +70,25 @@ func runReadingWorkspaceChecks() throws {
     let imported = snapshot.selection(folder: "PARENT01", pdfOnly: true)
     check(imported.count == 1 && imported.first?.zotero?.pdfKey == "PDF00001" && imported.first?.note == "作者 · 2021", "Zotero 按分类含子分类，识别附件并保留作者年份")
     check(imported.first?.target == "zotero://select/library/items/PAPER001" && imported.first?.canReadInside == true, "Zotero 文献保留条目链接并能进入 PDF 阅读")
+    check(imported.first?.zotero?.citationKey == "author2021" &&
+          snapshot.selection(folder: nil, pdfOnly: false).first(where: { $0.zotero?.itemKey == "BOOK0001" })?.zotero?.citationKey == "shu2020",
+          "Zotero 收录保存原生引文键，也识别旧 Extra 中固定的键")
     check(store.mergeItems(imported, label: "Zotero · 议题") && store.mergeItems(imported, label: "Zotero · 议题") &&
           store.library.items.filter { $0.zotero != nil }.count == 1, "重复导入跳过，保留单一收录批次")
     let prefs = FocusLayout(width: 2000, notebookWidth: 5, textSize: .infinity).normalized()
-    check(prefs.width == 1200 && prefs.notebookWidth == 240 && prefs.textSize == 17, "专注区域宽度与字号有安全上下限")
+    check(prefs.width == 1200 && prefs.notebookWidth == 240 && prefs.textSize == 18, "专注区域宽度与字号有安全上下限")
+    let oldLayout = try JSONDecoder().decode(FocusLayout.self, from: Data("""
+        {"width":680,"notebookWidth":300,"textSize":20,"deskTint":"sage","paperTint":"linen","noteTint":"mist"}
+        """.utf8))
+    var visibility = ReaderNotebookVisibility()
+    visibility[focused: false] = true
+    check(oldLayout.width == 680 && oldLayout.paragraphLineSpacing == 9 && !visibility[focused: true] && visibility[focused: false],
+          "旧版自定义版式继续可读，专注和普通视图各有独立笔记状态")
+    var readingPreferences = Preferences()
+    readingPreferences.readingWordEmphasis = true
+    check(readingPreferences.readingAid == .adaptive, "旧版开启的词首强调自动使用中英自适应")
+    readingPreferences.readingAidMode = .off
+    check(readingPreferences.readingAid == .off, "用户关闭后不再沿用旧版词首强调设置")
     let glance = GlanceCounts(store.library)
     check(glance.choices == 1 && glance.pending == 2, "阅读岛统计来自真实选择与待读条目")
 }

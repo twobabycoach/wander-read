@@ -35,4 +35,11 @@ func runCleanupChecks() throws {
     check(themed.library.preferences.appTheme=="night" && Palette.theme == .night,"主题设置跨重启保存")
     themed.selectTheme(.paper)
     check(AppTheme.allCases.count==5,"五套应用主题全部直接可用")
+    let dropStore = ReadingStore(directory: root.appendingPathComponent("drop"), refreshOnLoad: false)
+    let site = URL(string: "https://example.org/read")!
+    dropStore.importEntries([file, site, file, root])
+    let dropped = dropStore.library.items
+    check(dropped.map(\.title) == ["original", "example.org"] && dropped[0].importBatchID == dropped[1].importBatchID &&
+          dropStore.message?.contains("1 项无法收录") == true,
+          "一批拖入文件与网址时统一命名、去重和保存批次")
 }

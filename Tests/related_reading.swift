@@ -72,6 +72,28 @@ func runRelatedReadingChecks() throws {
     check(String(decorated.characters) == original &&
           decorated.runs.contains { $0.inlinePresentationIntent == .stronglyEmphasized },
           "词首强调保留中英文和换行，只附加强调样式")
+    let mixed = "🧭 历史唯物主义讨论社会结构与生产关系，也要考察制度变迁。 Reading evidence. 《资本论》 https://example.com/evidence （P87）"
+    let ranges = ReadingWordEmphasis.ranges(in: mixed, mode: .adaptive)
+    let nsMixed = mixed as NSString
+    let han = ranges.filter { ChineseReading.hasHan(nsMixed.substring(with: $0)) }
+    let protected = ["《资本论》", "https://example.com/evidence", "（P87）"].map { nsMixed.range(of: $0) }
+    check(!han.isEmpty && han.allSatisfy { nsMixed.substring(with: $0).count >= 2 } &&
+          zip(han, han.dropFirst()).allSatisfy { NSMaxRange($0) + 13 <= $1.location },
+          "中文仿生只稀疏强调完整词，避免逐字跳动")
+    check(ranges.contains { nsMixed.substring(with: $0) == "Re" } &&
+          ranges.allSatisfy { range in protected.allSatisfy { NSIntersectionRange($0, range).length == 0 } } &&
+          String(ReadingWordEmphasis.format(mixed).characters) == mixed,
+          "中英混排保留英文词首、书名、页注、链接和原文字符")
+    check(ReadingWordEmphasis.ranges(in: mixed, mode: .off).isEmpty &&
+          !ReadingWordEmphasis.ranges(in: mixed, mode: .english).isEmpty &&
+          ReadingWordEmphasis.ranges(in: mixed, mode: .english).allSatisfy { !ChineseReading.hasHan(nsMixed.substring(with: $0)) } &&
+          ReadingWordEmphasis.ranges(in: "[1] Reading evidence and social structure.", mode: .adaptive).isEmpty,
+          "仅英文模式保留中文原字重，参考文献条目不加阅读标记")
+    let traditional = "比較不同文獻中的勞動過程與生產關係，再回到材料中尋找證據。"
+    check(!ReadingWordEmphasis.ranges(in: traditional, mode: .adaptive).isEmpty &&
+          String(ReadingWordEmphasis.format(traditional).characters) == traditional &&
+          ReadingWordEmphasis.ranges(in: "GDPW＝正内部性福利价值－负外部性成本", mode: .adaptive).isEmpty,
+          "繁体中文可用整词强调，公式和原文内容保持完整")
 }
 
 private func writeRelatedPages(_ url: URL, pages: [String]) throws {

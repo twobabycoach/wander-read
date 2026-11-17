@@ -7,9 +7,9 @@ func writeChineseReadingFixture(_ url: URL, mode: String = "book") throws {
     guard let context = CGContext(url as CFURL, mediaBox: &bounds, nil) else {
         throw InputError.invalid("无法生成中文 PDF 样本。")
     }
-    func line(_ text: String, x: CGFloat = 64, y: CGFloat, size: CGFloat = 16) {
+    func line(_ text: String, x: CGFloat = 64, y: CGFloat, size: CGFloat = 16, font: String = "PingFangSC-Regular") {
         let value = NSAttributedString(string: text, attributes: [
-            kCTFontAttributeName as NSAttributedString.Key: CTFontCreateWithName("PingFangSC-Regular" as CFString, size, nil)
+            kCTFontAttributeName as NSAttributedString.Key: CTFontCreateWithName(font as CFString, size, nil)
         ])
         context.textPosition = CGPoint(x: x, y: y)
         CTLineDraw(CTLineCreateWithAttributedString(value), context)
@@ -73,6 +73,36 @@ func writeChineseReadingFixture(_ url: URL, mode: String = "book") throws {
                 line(tails[index], x: 62, y: 627, size: 14)
                 line("这一段正文必须保留供读者核对。", x: 84, y: 603, size: 14)
                 line("接下来用相同的字号说明资料为何值得比较。", x: 62, y: 585, size: 14)
+            }
+        }
+    } else if mode == "hierarchy" || mode == "hierarchy-toc" {
+        let headings: [(title: String, depth: Int, page: Int)] = [
+            ("第一编 专题研究", 0, 0), ("第一章 基本问题", 1, 0), ("第一节 方法与材料", 2, 0), ("一、研究设计", 3, 0),
+            ("（一）样本与范围", 4, 1), ("1 研究资料", 5, 1), ("1.1资料选取", 6, 1), ("1.1.1目录定位", 7, 1),
+            ("（二）分析步骤", 4, 2), ("第二节 文献对照", 2, 2),
+            ("第二章 研究结论", 1, 3), ("第一节 成果回顾", 2, 3), ("一、研究设计", 3, 3), ("参考文献", 0, 3)
+        ]
+        if mode == "hierarchy-toc" {
+            page {
+                line("目 录", y: 745, size: 23)
+                for (index, heading) in headings.enumerated() {
+                    line("\(heading.title) …… \(heading.page + 1)", x: 60 + CGFloat(heading.depth) * 12,
+                         y: 697 - CGFloat(index) * 31, size: 13)
+                }
+            }
+        }
+        for index in 0..<4 {
+            page {
+                for (row, heading) in headings.filter({ $0.page == index }).enumerated() {
+                    let y = 712 - CGFloat(row) * 150
+                    let sameSize = heading.title == "（一）样本与范围"
+                    line(heading.title, y: y, size: sameSize ? 11 : 18,
+                         font: sameSize ? "PingFangSC-Semibold" : "PingFangSC-Regular")
+                    let firstLine = y - (sameSize ? 16 : 45)
+                    line("正文需要完整保留，检索时以本页的实际标题作为锚点。", y: firstLine, size: 11)
+                    line("这一行与上一行属于同一段正文，属于标题下方的正式资料。", y: firstLine - 16, size: 11)
+                }
+                line("－ \(index + 1) －", x: 260, y: 39, size: 11)
             }
         }
     } else if mode == "numbered" || mode == "traditional" {
@@ -179,8 +209,48 @@ func runPDFChineseChecks() throws {
     check(PDFOutlineInference.detect(at: scan).isEmpty, "纯扫描页按页处理，正文目录不会自动调用 OCR")
     let recognized = try PDFScan.recognize(jpeg)
     check(recognized.contains("找到作者正在回答的问题"), "已有框选 OCR 实测能识别简体中文正文")
+    try runHierarchicalOutlineChecks(root)
     try runChineseAcademicChecks(root)
     try runChinesePageFlowChecks(root)
+}
+
+private func runHierarchicalOutlineChecks(_ root: URL) throws {
+    let url = root.appendingPathComponent("八层正文.pdf")
+    let contentsURL = root.appendingPathComponent("八层印刷目录.pdf")
+    try writeChineseReadingFixture(url, mode: "hierarchy")
+    try writeChineseReadingFixture(contentsURL, mode: "hierarchy-toc")
+    let document = PDFDocument(url: url)!
+    let expected = [0, 1, 2, 3, 4, 5, 6, 7, 4, 2, 1, 2, 3, 0]
+    let inferred = PDFOutlineInference.detect(in: document)
+    check(inferred.map(\.depth) == expected &&
+          inferred.filter { $0.title == "一、研究设计" }.map(\.location.page) == [0, 3],
+          "正文恢复编章节、中文序号、括号编号和点分编号，保留不同章的同名小节")
+
+    let printed = PDFOutlineBuilder.generate(at: contentsURL)
+    check(printed.map(\.depth) == expected && printed.map(\.location?.page) == [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 4, 4]
+          && printed.contains(where: { $0.title == "1 研究资料" && $0.printedLabel == "2" }),
+          "印刷目录保留全部层级并将章号与行末印刷页码分开")
+
+    let flat = inferred.map { PDFOutlineCandidate(title: $0.title, location: $0.location) }
+    let suggested = PDFOutlineCalibration.corrections(for: flat, matched: [:], preserveDepths: false)
+    let rebuilt = flat.map { suggested[$0.id]?.depth ?? $0.depth }
+    check(rebuilt == expected &&
+          PDFOutlineCalibration.corrections(for: flat, matched: [:], preserveDepths: true).isEmpty,
+          "校准为旧平铺目录提出层级修正，保留 PDF 自带目录的层级")
+
+    let inventory = try PDFOutlineCalibration.inventory(in: document)
+    let generated = PDFOutlineCalibration.assembled(inventory.options, selected: [0: 0], includeReliable: true)
+    check(generated.map(\.depth) == expected, "模型漏报或把首项标为一级时仍保留有原文编号证据的完整层级")
+    let dotted = ["1. 方法", "1.1 研究对象", "1.1.1样本", "2.1 讨论", "2.1.1结果", "3. 小结"]
+    check(PDFOutlineHierarchy.depths(dotted.map { .init(title: $0) }) == [0, 1, 2, 0, 1, 0],
+          "点分编号只在前缀对应时挂入上一层，缺失的父标题不会虚构")
+
+    if let first = inferred.first, inferred.indices.contains(7) {
+        let visible = PDFOutlineHierarchy.visibleSections(inferred, collapsed: [first.id])
+        check(visible.map(\.depth) == [0, 0]
+              && PDFOutlineHierarchy.ancestors(of: inferred[7].id, in: inferred) == Set(inferred.prefix(7).map(\.id)),
+              "目录可以收起整条分支，并定位到当前小节的全部上级")
+    }
 }
 
 private func runChinesePageFlowChecks(_ root: URL) throws {
