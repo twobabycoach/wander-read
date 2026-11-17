@@ -6,7 +6,7 @@
 
 [下载 macOS 安装包](https://github.com/twobabycoach/wander-read/releases/download/v0.9.12/WanderRead-0.9.12-macOS-arm64.zip)适用于 Apple 芯片 Mac，要求 macOS 13 或更新版本。解压后，将「漫读.app」拖到「应用程序」。
 
-这一版为论文摘录写入 Zotero 引文键，能确认版面页码时也会随引文写入。例如 `[@example2025, p. 12]`。PDF、文本和双语对照都可以批量发送到 Obsidian，自定义模板支持 `{citation}` 和 `{citekey}`。
+这一版为论文摘录写入 Zotero 引文键，能确认版面页码时也会随引文写入。例如 `[@example2025, p. 12]`。PDF、文本和双语对照都可以批量发送到 Obsidian，自定义模板支持 `{{citation}}` 和 `{{citekey}}`。
 
 漫读是一款原生 macOS 稍后阅读应用。先收下想读的内容，每次只看一小批候选，选中感兴趣的一篇再开始读。收藏、推荐、笔记和中文 PDF 识别都在本机运行。
 
