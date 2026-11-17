@@ -1,18 +1,33 @@
 import SwiftUI
 import AppKit
-struct ThemeChooser:View {
-    @ObservedObject var store:ReadingStore
-    var body:some View {
-        VStack(alignment:.leading,spacing:14) {
-            Text("换一种心情").font(.system(size:19,weight:.medium,design:.serif))
-            Text("应用外观随时切换，全部可用；分享图配色另行选择。").font(.system(size:12)).foregroundColor(Palette.muted)
-            HStack(spacing:12) {ForEach(AppTheme.allCases) {theme in
-                Button {store.selectTheme(theme)} label:{VStack(alignment:.leading,spacing:9) {
-                    HStack(spacing:4) {RoundedRectangle(cornerRadius:4).fill(theme.color(1)).frame(width:20);RoundedRectangle(cornerRadius:4).fill(theme.color(6))}.frame(height:38).padding(7).background(theme.color(0)).cornerRadius(8)
-                    HStack {Text(theme.title).font(.system(size:13,weight:.medium));Spacer();if (store.library.preferences.appTheme ?? "paper")==theme.rawValue {Image(systemName:"checkmark.circle.fill").foregroundColor(Palette.green)}}
-                    Text(theme.detail).font(.system(size:10)).foregroundColor(Palette.muted)
-                }.padding(10).frame(maxWidth:.infinity).background(Palette.surface).cornerRadius(12)}.buttonStyle(.plain)
-            }}
+struct ThemeChooser: View {
+    @ObservedObject var store: ReadingStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("应用外观").font(.system(size: 16, weight: .semibold))
+            HStack(spacing: 8) {
+                ForEach(AppTheme.allCases) { theme in
+                    let selected = (store.library.preferences.appTheme ?? AppTheme.paper.rawValue) == theme.rawValue
+                    Button { store.selectTheme(theme) } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 0) {
+                                theme.color(1).frame(width: 18)
+                                theme.color(0).overlay(alignment: .leading) {
+                                    Image(systemName: "text.alignleft").foregroundColor(theme.color(2)).padding(.leading, 7)
+                                }
+                            }.frame(height: 36).clipShape(RoundedRectangle(cornerRadius: 5))
+                                .overlay { RoundedRectangle(cornerRadius: 5).strokeBorder(theme.color(5).opacity(0.75)) }
+                                .accessibilityHidden(true)
+                            HStack(spacing: 4) {
+                                Text(theme.title)
+                                Spacer(minLength: 0)
+                                if selected { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)) }
+                            }
+                        }.frame(maxWidth: .infinity).padding(.vertical, 6)
+                    }.buttonStyle(ReadingControlStyle(selected: selected)).help(theme.detail)
+                }
+            }
         }
     }
 }
@@ -30,11 +45,26 @@ struct DataManager:View {
     var visibleIDs:Set<UUID> {Set(entries.map(\.id))}
     var body:some View {
         VStack(alignment:.leading,spacing:18) {
-            HStack {Text("把收藏理一理").font(.system(size:26,weight:.medium,design:.serif));Spacer();Button("完成") {dismiss()}.buttonStyle(ActionStyle())}
+            HStack {Text("管理收藏").font(.system(size:20,weight:.semibold));Spacer();Button("完成") {dismiss()}.buttonStyle(ReadingControlStyle(accented:true))}
             HStack {Button("修复 Obsidian 入口…") {repairing=true}.buttonStyle(.plain);if !(store.library.linkRepairUndo ?? []).isEmpty {Button("撤销链接修复",action:store.undoRepairs).buttonStyle(.plain)}}.font(.system(size:12)).foregroundColor(Palette.green)
             Text("这里只清理漫读中的入口。PDF、Obsidian 笔记和卡片不会被删除。").font(.system(size:12)).foregroundColor(Palette.muted)
-            Picker("查看",selection:$trash) {Text("收藏").tag(false);Text("回收站").tag(true)}.pickerStyle(.segmented).onChange(of:trash) {_ in selected=[];batch="全部"}
-            HStack {TextField("搜索标题或路径",text:$search).textFieldStyle(.roundedBorder);if !trash {Picker("导入批次",selection:$batch) {Text("全部").tag("全部");ForEach(batches,id:\.self) {Text($0).tag($0)}}.frame(width:300)}}
+            HStack {
+                ReadingTabs(selection: $trash, options: [(false, "收藏"), (true, "回收站")])
+                    .onChange(of: trash) { _ in selected = []; batch = "全部" }
+                Spacer()
+                ReadingSearchField(prompt: "搜索标题或路径", query: $search).frame(width: 230)
+                if !trash {
+                    Menu {
+                        Picker("导入批次", selection: $batch) {
+                            Text("所有批次").tag("全部")
+                            ForEach(batches, id: \.self) { Text($0).tag($0) }
+                        }
+                    } label: {
+                        Label(batch == "全部" ? "所有批次" : batch, systemImage: "square.stack")
+                            .lineLimit(1).frame(maxWidth: 180)
+                    }.menuStyle(.borderlessButton).help(batch)
+                }
+            }
             HStack {
                 Toggle("全选当前结果（\(entries.count) 篇）",isOn:Binding(get:{!visibleIDs.isEmpty && visibleIDs.isSubset(of:selected)},set:{if $0 {selected.formUnion(visibleIDs)} else {selected.subtract(visibleIDs)}})).toggleStyle(.checkbox)
                 Button("全选全部") {search="";batch="全部";selected=Set(store.library.items.filter {($0.trashedAt != nil)==trash}.map(\.id))}.buttonStyle(ActionStyle())

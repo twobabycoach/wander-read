@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f5ef">
+  <meta name="description" content="漫读是一款原生 Mac 稍后阅读应用。从少量候选中选一篇，专注读中文 PDF，把有出处的摘录送到 Obsidian。">
+  <meta property="og:title" content="漫读 · Mac 上的稍后阅读">
+  <meta property="og:description" content="收下想读的材料，挑一篇专心读。下载漫读 0.9.12。">
+  <meta property="og:image" content="https://twobabycoach.github.io/wander-read/assets/discover.jpg">
+  <meta property="og:url" content="https://twobabycoach.github.io/wander-read/">
+  <link rel="canonical" href="https://twobabycoach.github.io/wander-read/">
+  <link rel="icon" href="assets/icon.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
+  <title>漫读 · Mac 上的稍后阅读</title>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main">跳到正文</a>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="wordmark" href="#top" aria-label="漫读首页">
+        <img src="assets/icon.png" width="37" height="37" alt="">
+        <span>漫读</span>
+      </a>
+      <nav aria-label="主导航">
+        <a class="nav-detail" href="#reading">阅读体验</a>
+        <a class="nav-detail" href="https://github.com/twobabycoach/wander-read">源码 ↗</a>
+        <a class="nav-download" href="#download">下载</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="title">
+      <div class="hero-copy">
+        <p class="platform">Mac 上的稍后阅读</p>
+        <h1 id="title">把想读的收下来，<br class="desktop-break">专心读一篇。</h1>
+        <p class="lede">待读材料再多，每次也只看一小批。值得留下的原文和想法，带着出处送进 Obsidian。</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://github.com/twobabycoach/wander-read/releases/download/v0.9.12/WanderRead-0.9.12-macOS-arm64.zip">
+            下载 macOS 版 <span aria-hidden="true">↓</span>
+          </a>
+          <span class="version">0.9.12</span>
+        </div>
+        <p class="requirements">Apple 芯片 · macOS 13 或更新版本</p>
+      </div>
+      <figure class="hero-art">
+        <img class="app-shot" src="assets/discover.jpg" width="1220" height="804"
+             alt="漫读发现页呈现三篇候选，带有换一批和阅读入口" fetchpriority="high">
+      </figure>
+    </section>
+
+    <section class="wrap workflow" id="reading" aria-labelledby="workflow-heading">
+      <h2 id="workflow-heading">从选文到留下出处</h2>
+      <div class="steps">
+        <article>
+          <h3>选一篇</h3>
+          <p>收下网页、PDF、Markdown，也可从 Zotero 或 Obsidian 收录。每批最多三篇，随时换一批。</p>
+        </article>
+        <article>
+          <h3>读进去</h3>
+          <p>用专注模式留出阅读空间。中文 PDF 可按章节折叠、识别多级目录，点标题回原页。</p>
+        </article>
+        <article>
+          <h3>留下原文和想法</h3>
+          <p>划线、摘录或写批注，再发送到 Obsidian。支持按文献归档、批量发送和回到原文。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="reader-feature" aria-labelledby="feature-heading">
+      <div class="wrap feature-content">
+        <figure class="feature-art">
+          <img class="app-shot" src="assets/reading.jpg" width="1220" height="804" loading="lazy"
+               alt="深夜主题的漫读 PDF 阅读窗口，右侧展示示例文稿摘录与批注">
+        </figure>
+        <div class="feature-copy">
+          <h2 id="feature-heading">摘录带着引文走</h2>
+          <p>关联 Zotero 的论文，会把已有的引文键写进 Markdown。能确认版面页码时，引文里也会带上页码。</p>
+          <figure class="citation-example">
+            <figcaption>Obsidian 笔记示例</figcaption>
+            <blockquote>把原文、页码和自己的疑问一起写下。</blockquote>
+            <code>[@example2025, p. 12]</code>
+          </figure>
+          <p class="feature-detail">收件位置与笔记模板可以自定义。同一篇文献的摘录会追加到同一份笔记。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="wrap download-section" id="download" aria-labelledby="download-heading">
+      <div class="download-card">
+        <div>
+          <h2 id="download-heading">在 Mac 上安装漫读</h2>
+          <p>0.9.12 · Apple 芯片 · macOS 13 或更新版本</p>
+        </div>
+        <a class="button button-light" href="https://github.com/twobabycoach/wander-read/releases/download/v0.9.12/WanderRead-0.9.12-macOS-arm64.zip">
+          下载 ZIP <span aria-hidden="true">↓</span>
+        </a>
+      </div>
+      <div class="download-details">
+        <details>
+          <summary>第一次安装</summary>
+          <p>解压 ZIP，把「漫读.app」拖进「应用程序」。如果 macOS 提示无法验证开发者，可以在确认下载来源后前往「系统设置 → 隐私与安全性」选择「仍要打开」。<a href="https://support.apple.com/zh-cn/102445">Apple 的说明 ↗</a></p>
+        </details>
+        <details>
+          <summary>这一版更新了什么</summary>
+          <p>论文摘录支持 Zotero 引文键和版面页码。原页、折叠、文本与双语对照的常用操作更一致，批量发送带有进度、结果和重试入口。<a href="https://github.com/twobabycoach/wander-read/releases/tag/v0.9.12">0.9.12 发布说明 ↗</a></p>
+        </details>
+        <p class="download-links">
+          <a href="https://github.com/twobabycoach/wander-read/releases">所有版本 ↗</a>
+          <a href="https://github.com/twobabycoach/wander-read/releases/download/v0.9.12/WanderRead-0.9.12-SHA256.txt">SHA-256 校验 ↗</a>
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>漫读 WanderRead</span>
+      <div>
+        <a href="https://github.com/twobabycoach/wander-read">GitHub ↗</a>
+        <a href="https://github.com/twobabycoach/wander-read/blob/main/LICENSE">MIT 许可 ↗</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

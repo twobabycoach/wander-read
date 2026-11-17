@@ -14,6 +14,9 @@ final class ReadingStore: ObservableObject {
     @Published var page = "发现"
     @Published var latestMilestone: MilestoneDefinition?
     let dataURL: URL
+    let translations: ReadingTranslationArchive
+    let pdfTranslationJobs: PDFTranslationJobs
+    var translationPanelOpen = false
     let isPreview: Bool
     private(set) var recoveryRequired = false
     private var semanticFingerprint:Int?
@@ -66,6 +69,8 @@ final class ReadingStore: ObservableObject {
         isPreview=preview
         let root = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("WanderRead")
         dataURL = root.appendingPathComponent("library.json")
+        translations = ReadingTranslationArchive(root: root.appendingPathComponent("Translations", isDirectory: true))
+        pdfTranslationJobs = PDFTranslationJobs(archive: translations)
         if FileManager.default.fileExists(atPath: dataURL.path) {
             do { library = try LibraryIO.decode(Data(contentsOf: dataURL)) }
             catch { recoveryRequired = true; self.error = "资料文件未能读取，已停止写入以保护原文件。可在偏好里导入备份恢复。\n\(error.localizedDescription)" }
@@ -387,14 +392,44 @@ final class ReadingStore: ObservableObject {
         if commit({ l in let ids = Set(l.items.filter(\.isDemo).map(\.id)); l.items.removeAll { ids.contains($0.id) }; l.sessions.removeAll { ids.contains($0.itemID) }; l.exposures?.removeAll {ids.contains($0.itemID)};l.researchEvents?.removeAll {ids.contains($0.itemID)} }) { fillQueueIfNeeded() }
     }
     func importFiles(_ urls: [URL]) {
-        let newItems = urls.filter { !$0.hasDirectoryPath }.map { ReadingItem(title:$0.deletingPathExtension().lastPathComponent, target:$0.path, tags:["本地文件"]) }
-        mergeItems(newItems)
+        importEntries(urls.filter(\.isFileURL))
     }
-    @discardableResult func mergeItems(_ items: [ReadingItem], label:String = "本地文件") -> Bool {
-        let batch=UUID(),importedAt=Date()
+
+    func importEntries(_ urls: [URL], unreadable: Int = 0) {
+        let items: [ReadingItem] = urls.compactMap { url in
+            if url.isFileURL && (url.hasDirectoryPath || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true) {
+                return nil
+            }
+            guard let target = try? Targets.normalize(url.absoluteString), let title = Targets.suggestedTitle(target) else { return nil }
+            return ReadingItem(title: title, target: target, tags: url.isFileURL ? ["本地文件"] : [])
+        }
+        guard !items.isEmpty else {
+            message = "没有可收录的文件或链接。"
+            return
+        }
+        let allLocal = items.allSatisfy { $0.target.hasPrefix("/") }
+        if mergeItems(items, label: allLocal ? "本地文件" : "拖入的内容") {
+            let skipped = urls.count - items.count + unreadable
+            if skipped > 0, let message { self.message = message + "另有 \(skipped) 项无法收录。" }
+        }
+    }
+    @discardableResult func mergeItems(_ items: [ReadingItem], label: String = "本地文件", zoteroScope: ZoteroImportScope? = nil) -> Bool {
+        let batch = UUID(), importedAt = Date()
         var added = 0
-        if commit({ l in var keys = Set(l.items.map { Targets.key($0.target) }); for item in items where !keys.contains(Targets.key(item.target)) { var saved=item;saved.importBatchID=batch;saved.importBatchLabel=label;saved.createdAt=importedAt;l.items.append(saved); keys.insert(Targets.key(item.target)); added += 1 } }) {
-            message = "收下 \(added) 篇，跳过 \(items.count-added) 篇重复内容。"; fillQueueIfNeeded(); return true
+        if commit({ library in
+            var keys = Set(library.items.map { Targets.key($0.target) })
+            for var item in items where keys.insert(Targets.key(item.target)).inserted {
+                item.importBatchID = batch
+                item.importBatchLabel = label
+                item.createdAt = importedAt
+                library.items.append(item)
+                added += 1
+            }
+            if let zoteroScope { library.preferences.lastZoteroImport = zoteroScope }
+        }) {
+            message = "收下 \(added) 篇，跳过 \(items.count - added) 篇重复内容。"
+            fillQueueIfNeeded()
+            return true
         }
         return false
     }

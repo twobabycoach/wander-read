@@ -50,7 +50,7 @@ func writeScanFixture(_ url: URL, from jpeg: Data) throws {
     context.closePDF()
 }
 
-func runPDFChapterScanChecks() throws {
+func runPDFChapterScanChecks() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("wander-chapter-scan-\(UUID())")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -78,6 +78,12 @@ func runPDFChapterScanChecks() throws {
     check(reader.chapters(unit: .page, groupSize: 3).count == 4 &&
           reader.chapters(unit: .group, groupSize: 2).map { $0.pages(total: 4) } == [0..<2, 2..<4],
           "按单页和用户选择的连续页数折叠")
+    let longChapter = PDFChapter(id: 1, title: "长章节", start: PDFReadingLocation(page: 12),
+                                 end: PDFReadingLocation(page: 184, point: CGPoint(x: 40, y: 620)), depth: 0)
+    check(longChapter.initialPages(around: 142, total: 200) == 141..<149 &&
+          longChapter.initialPages(around: 184, total: 200) == 183..<185 &&
+          longChapter.initialPages(around: 10, total: 200) == 12..<20,
+          "长章节从续读页附近加载，保留前一页的接段机会和同页章尾")
     let crop = CGRect(x: 50, y: 710, width: 210, height: 48)
     let bytes = try PDFScan.image(of: reader.document.page(at: 0)!, region: crop)
     let scanPath = root.appendingPathComponent("扫描样本.pdf")
@@ -104,7 +110,7 @@ func runPDFChapterScanChecks() throws {
     try FileManager.default.createDirectory(at: vault.appendingPathComponent(".obsidian"), withIntermediateDirectories: true)
     let settings = NotebookExportSettings(vault: vault.path)
     check(store.commit { $0.preferences.notebookExport = settings }, "图摘准备 Obsidian 收件位置")
-    let result = try store.sendNotebookNotes([captured.id], from: scanItem.id)
+    let result = try await store.sendNotebookNotes([captured.id], from: scanItem.id)
     let folder = try settings.directory()
     let output = try String(contentsOf: folder.appendingPathComponent(result.delivery.file), encoding: .utf8)
     let imageFile = folder.appendingPathComponent("附件/漫读-\(captured.id.uuidString.lowercased()).jpg")

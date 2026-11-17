@@ -5,12 +5,13 @@ import Combine
 struct GlanceSettings: View {
     @ObservedObject var store: ReadingStore
     var inPopover = false
+    var tabTint: Color? = nil
     private var settings: GlancePreferences { store.library.preferences.glance ?? GlancePreferences() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if !inPopover {
-                Text("阅读岛").font(.system(size: 19, weight: .medium, design: .serif))
+                Text("阅读岛").font(.system(size: 16, weight: .semibold))
                 Text("抬眼看一眼今天，顺手暂停、续读或换一批。").font(.system(size: 13)).foregroundColor(Palette.muted)
             }
             VStack(alignment: .leading, spacing: 10) {
@@ -27,10 +28,12 @@ struct GlanceSettings: View {
                 Toggle("一览数据", isOn: binding(\.counts))
                 Toggle("快捷操作", isOn: binding(\.actions))
             }.toggleStyle(.checkbox)
-            Picker("配色", selection: binding(\.ink)) {
-                Text("深墨").tag(true)
-                Text("跟随主题").tag(false)
-            }.pickerStyle(.segmented)
+            HStack {
+                Text("配色").font(.system(size: 12)).foregroundColor(Palette.muted)
+                Spacer()
+                ReadingTabs(selection: binding(\.ink), options: [(true, "深墨"), (false, "跟随主题")],
+                            tint: tabTint ?? (Palette.theme.isDark ? .white : Palette.green))
+            }
         }.tint(Palette.accent)
     }
 
@@ -73,7 +76,7 @@ struct GlanceBoard: View {
             }
             Divider()
             if settingsOpen {
-                GlanceSettings(store: store, inPopover: true)
+                GlanceSettings(store: store, inPopover: true, tabTint: accent)
                     .foregroundColor(ink)
             } else {
                 TimelineView(.periodic(from: Date(), by: 30)) { context in
@@ -187,6 +190,7 @@ final class GlanceController: NSObject, NSPopoverDelegate {
             if status == nil {
                 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
                 item.button?.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "漫读阅读岛")
+                item.button?.image?.isTemplate = true
                 item.button?.toolTip = "漫读阅读岛"
                 item.button?.target = self
                 item.button?.action = #selector(statusClicked)
@@ -238,11 +242,11 @@ final class GlanceController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func statusClicked() {
-        if let button = status?.button { toggle(relativeTo: button) }
+        if let button = status?.button { toggle(relativeTo: button, fromPointer: true) }
     }
 
     @objc private func islandClicked() {
-        if let capsule { toggle(relativeTo: capsule) }
+        if let capsule { toggle(relativeTo: capsule, fromPointer: true) }
     }
 
     func show() {
@@ -251,24 +255,27 @@ final class GlanceController: NSObject, NSPopoverDelegate {
         else { showMain(); store.page = "偏好" }
     }
 
-    private func toggle(relativeTo anchor: NSView) {
+    private func toggle(relativeTo anchor: NSView, fromPointer: Bool = false) {
         let wasSame = popover.isShown && popoverAnchor === anchor
         if popover.isShown { popover.performClose(nil) }
         guard !wasSame else { return }
         let board = GlanceBoard(store: store, showMain: showMain, close: { [weak self] in self?.popover.performClose(nil) })
+        let dark = (store.library.preferences.glance ?? GlancePreferences()).ink || Palette.theme.isDark
+        popover.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let host = NSHostingController(rootView: board)
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.contentSize = host.view.fittingSize
         popoverAnchor = anchor
-        let mouseEvents: Set<NSEvent.EventType> = [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp]
-        pointerOpened = NSApp.currentEvent.map { mouseEvents.contains($0.type) } ?? false
+        pointerOpened = fromPointer
         popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
     }
 
     func popoverDidShow(_ notification: Notification) {
         if pointerOpened, let content = popover.contentViewController?.view {
-            content.window?.makeFirstResponder(content)
+            // A hosting view refuses first responder; asking it to take focus leaves
+            // the first SwiftUI button focused. Clear it only for pointer openings.
+            content.window?.makeFirstResponder(nil)
         }
     }
 }

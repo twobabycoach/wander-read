@@ -11,8 +11,8 @@ cat > dist/漫读.app/Contents/Info.plist <<'PLIST'
 <key>CFBundleDisplayName</key><string>漫读</string>
 <key>CFBundleIdentifier</key><string>local.wanderread.mac</string>
 <key>CFBundleExecutable</key><string>WanderRead</string>
-<key>CFBundleVersion</key><string>23</string>
-<key>CFBundleShortVersionString</key><string>0.9.0</string>
+<key>CFBundleVersion</key><string>35</string>
+<key>CFBundleShortVersionString</key><string>0.9.12</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>

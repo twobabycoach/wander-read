@@ -8,7 +8,11 @@ struct NotebookExportSettings: Codable, Equatable {
     var entry = Self.defaultEntry
 
     static let defaultHeader = "# {{title}}"
-    static let defaultEntry = "### {{kind}} · {{location}}\n\n{{image}}\n\n{{blockquote}}\n\n{{comment}}\n\n{{source_link}}"
+    private static let entryBlocks = ["### {{kind}} · {{location}}", "{{image}}", "{{blockquote}}", "{{comment}}", "{{citation}}", "{{source_link}}"]
+    static let defaultEntry = entryBlocks.joined(separator: "\n\n")
+    static let previousDefaultEntry = entryBlocks.filter { $0 != "{{citation}}" }.joined(separator: "\n\n")
+
+    var usesDefaultEntry: Bool { entry == Self.defaultEntry || entry == Self.previousDefaultEntry }
 
     func directory() throws -> URL {
         guard vault.hasPrefix("/") else { throw InputError.invalid("请先选择一个 Obsidian 仓库。") }
@@ -63,6 +67,7 @@ struct ReaderNote: Identifiable {
     var color = ""
     var date: Date?
     var image: Data?
+    var citationLocator: String?
 
     init(id: UUID, kind: String, location: String, quote: String, comment: String, color: String = "", date: Date? = nil) {
         self.id = id; self.kind = kind; self.location = location; self.quote = quote; self.comment = comment
@@ -73,16 +78,32 @@ struct ReaderNote: Identifiable {
         let pages = mark.lines.map(\.page) + [mark.location.page]
         let start = (pages.min() ?? mark.location.page) + 1
         let end = (pages.max() ?? mark.location.page) + 1
-        let kind = mark.scan != nil ? "图摘" : mark.isExcerpt == true ? "摘录" : mark.kind == .detour ? "暂放" : mark.lines.isEmpty ? "页边记" : mark.note.isEmpty ? "高亮" : "批注"
+        let kind = mark.scan != nil ? "图摘" : mark.isExcerpt == true ? "摘录" : mark.kind == .detour ? "暂放" : mark.lines.isEmpty ? "页边记" : mark.note.isEmpty ? mark.appearance.style.title : "批注"
         let printed = mark.printedPage.map { " · 版面 " + $0 } ?? ""
-        let place = start == end ? "PDF 第 \(start) 页" + printed : "PDF 第 \(start)–\(end) 页"
+        let range = mark.printedPage.flatMap { first in mark.printedPageEnd.map { "\(first)–\($0)" } }
+        let place = start == end ? "PDF 第 \(start) 页" + (mark.printedPage == String(start) ? "" : printed)
+            : "PDF 第 \(start)–\(end) 页" + (range.map { " · 版面 " + $0 } ?? "")
         self.init(id: mark.id, kind: kind, location: place,
-                  quote: mark.quote, comment: mark.note, color: mark.lines.isEmpty ? "" : (mark.color ?? .yellow).title, date: mark.createdAt)
+                  quote: mark.quote, comment: mark.note, color: mark.lines.isEmpty ? "" : mark.appearance.color.title, date: mark.createdAt)
         image = mark.scan?.jpeg
+        if let first = Self.pageLocator(mark.printedPage) {
+            if start == end {
+                citationLocator = "p. \(first)"
+            } else if let last = Self.pageLocator(mark.printedPageEnd) {
+                citationLocator = "pp. \(first)–\(last)"
+            }
+        }
     }
 
     init(_ excerpt: TextExcerpt) {
-        self.init(id: excerpt.id, kind: "摘录", location: excerpt.place, quote: excerpt.quote, comment: excerpt.note, date: excerpt.createdAt)
+        self.init(id: excerpt.id, kind: "摘录", location: excerpt.place, quote: excerpt.quote, comment: excerpt.note,
+                  color: excerpt.markAppearance?.color.title ?? "", date: excerpt.createdAt)
+    }
+
+    private static func pageLocator(_ label: String?) -> String? {
+        let folio = #"\A(?:[IVXLCDMivxlcdm]+|[A-Za-z]*[-.]?[0-9]+[A-Za-z]?)\z"#
+        guard let label, label.range(of: folio, options: .regularExpression) != nil else { return nil }
+        return label
     }
 }
 
@@ -109,10 +130,11 @@ enum NotebookExport {
     struct Result {
         let delivery: NotebookDelivery
         let written: Int
+        let citationKey: String?
     }
 
     static let fields = ["title", "kind", "location", "quote", "blockquote", "comment", "image", "color", "source_link", "source_url",
-                         "tags", "created_at", "excerpt_id", "zotero_item_key"]
+                         "tags", "created_at", "excerpt_id", "zotero_item_key", "citation", "citekey"]
     private static let variable = try! NSRegularExpression(pattern: #"\{\{\s*([A-Za-z_][A-Za-z_0-9]*)\s*\}\}"#)
     private static let maxBytes = 12_000_000
 
@@ -131,18 +153,41 @@ enum NotebookExport {
         return output
     }
 
-    static func values(item: ReadingItem, note: ReaderNote) -> [String: String] {
+    static func citationKey(for item: ReadingItem, resolved: String? = nil) -> String? {
+        CitationKey.normalized(item.citationKey) ?? CitationKey.normalized(resolved) ?? CitationKey.normalized(item.zotero?.citationKey)
+    }
+
+    static func values(item: ReadingItem, note: ReaderNote, resolvedCitekey: String? = nil) -> [String: String] {
         let link = ReaderNoteLink(itemID: item.id, noteID: note.id).url
         let quoted = note.quote.isEmpty ? "" : note.quote.components(separatedBy: "\n").map { $0.isEmpty ? ">" : "> " + $0 }.joined(separator: "\n")
         let date = note.date.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+        let key = citationKey(for: item, resolved: resolvedCitekey)
+        let cite = key.map { CitationKey.markdown($0, locator: note.citationLocator) } ?? ""
         return ["title": item.title, "kind": note.kind, "location": note.location, "quote": note.quote,
                 "image": note.image == nil ? "" : "![框选原图](<附件/\(imageName(note.id))>)",
                 "blockquote": quoted, "comment": note.comment, "color": note.color, "source_link": "[在漫读中回到原文](\(link))",
                 "source_url": item.target, "tags": item.tags.joined(separator: "、"), "created_at": date,
-                "excerpt_id": note.id.uuidString.lowercased(), "zotero_item_key": item.zotero?.itemKey ?? ""]
+                "excerpt_id": note.id.uuidString.lowercased(), "zotero_item_key": item.zotero?.itemKey ?? "",
+                "citation": cite, "citekey": key ?? ""]
     }
 
-    static func deliver(_ notes: [ReaderNote], from item: ReadingItem, using settings: NotebookExportSettings) throws -> Result {
+    static func renderEntry(_ settings: NotebookExportSettings, fields: [String: String]) throws -> String {
+        if settings.usesDefaultEntry {
+            return try NotebookExportSettings.defaultEntry.components(separatedBy: "\n\n")
+                .map { try render($0, fields: fields) }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .joined(separator: "\n\n")
+        }
+        let text = try render(settings.entry, fields: fields)
+        let template = settings.entry as NSString
+        let fieldsInTemplate = variable.matches(in: settings.entry, range: NSRange(location: 0, length: template.length))
+            .map { template.substring(with: $0.range(at: 1)) }
+        guard let cite = fields["citation"], !cite.isEmpty, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !fieldsInTemplate.contains("citation"), !fieldsInTemplate.contains("citekey") else { return text }
+        return text + "\n\n" + cite
+    }
+
+    static func deliver(_ notes: [ReaderNote], from item: ReadingItem, using settings: NotebookExportSettings,
+                        resolvedCitekey: String? = nil) throws -> Result {
         try settings.validate()
         let directory = try settings.directory()
         guard let first = notes.first else { throw InputError.invalid("请先选择要发送的笔记。") }
@@ -155,10 +200,13 @@ enum NotebookExport {
         let storedFile = previous?.file ?? initial
         let file = storedFile == URL(fileURLWithPath: storedFile).lastPathComponent && storedFile.hasSuffix(".md") && !storedFile.hasPrefix(".") ? storedFile : initial
         var delivery = NotebookDelivery(directory: directory.path, file: file, sent: previous?.sent ?? [])
-        guard notes.contains(where: { !delivery.sent.contains($0.id) }) else { return Result(delivery: delivery, written: 0) }
+        let key = citationKey(for: item, resolved: resolvedCitekey)
+        guard notes.contains(where: { !delivery.sent.contains($0.id) }) else {
+            return Result(delivery: delivery, written: 0, citationKey: key)
+        }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let marker = "<!-- wanderread-document:\(id) -->"
-        let header = try render(settings.header, fields: values(item: item, note: first))
+        let header = try render(settings.header, fields: values(item: item, note: first, resolvedCitekey: resolvedCitekey))
         let target = directory.appendingPathComponent(file)
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinationError: NSError?
@@ -194,8 +242,8 @@ enum NotebookExport {
                 for note in notes where !delivery.sent.contains(note.id) {
                     let noteMarker = "<!-- wanderread-note:\(note.id.uuidString.lowercased()) -->"
                     if !lines.contains(noteMarker) {
-                        let fields = values(item: item, note: note)
-                        let text = try render(settings.entry, fields: fields)
+                        let fields = values(item: item, note: note, resolvedCitekey: resolvedCitekey)
+                        let text = try renderEntry(settings, fields: fields)
                         if let image = note.image, let link = fields["image"], text.contains(link) {
                             assets.append((note.id, image))
                         }
@@ -243,7 +291,7 @@ enum NotebookExport {
                         throw error
                     }
                 }
-                return Result(delivery: delivery, written: additions.count)
+                return Result(delivery: delivery, written: additions.count, citationKey: key)
             }
         }
         if let coordinationError { throw coordinationError }
@@ -276,16 +324,40 @@ extension ReadingStore {
         return library.items.first { $0.id == id }?.notebookDeliveries?.first { $0.directory == directory }?.sent ?? []
     }
 
-    func sendNotebookNotes(_ ids: Set<UUID>, from itemID: UUID) throws -> NotebookExport.Result {
-        guard !recoveryRequired, let item = library.items.first(where: { $0.id == itemID && $0.trashedAt == nil }),
+    @MainActor
+    func sendNotebookNotes(_ ids: Set<UUID>, from itemID: UUID) async throws -> NotebookExport.Result {
+        guard !recoveryRequired, let source = library.items.first(where: { $0.id == itemID && $0.trashedAt == nil }),
               let settings = library.preferences.notebookExport else { throw InputError.invalid("请先设置 Obsidian 收件位置。") }
+        let resolved = isPreview || CitationKey.normalized(source.citationKey) != nil || ids.isSubset(of: deliveredNotes(for: itemID))
+            ? nil : await ZoteroAPI.citationKey(for: source)
+        try Task.checkCancellation()
+        guard let item = library.items.first(where: { $0.id == itemID && $0.trashedAt == nil }),
+              item.target == source.target, item.zotero?.itemKey == source.zotero?.itemKey else {
+            throw InputError.invalid("文献的来源已变化，请从阅读侧栏重新发送。")
+        }
+        guard library.preferences.notebookExport == settings else {
+            throw InputError.invalid("Obsidian 收件设置已变化，请按新设置重新发送。")
+        }
         let notes = (item.pdfReading?.marks.map(ReaderNote.init) ?? []) + (item.textReading?.excerpts.map(ReaderNote.init) ?? [])
-        let result = try NotebookExport.deliver(notes.filter { ids.contains($0.id) }, from: item, using: settings)
-        let delivery = result.delivery
-        let old = item.notebookDeliveries ?? []
-        if !old.contains(delivery) {
-            guard mutate(itemID, { $0.notebookDeliveries = old.filter { $0.directory != delivery.directory } + [delivery] }) else {
-                throw InputError.invalid("笔记已写入 Obsidian，漫读暂时无法保存发送回执。重试会核对笔记里的记录。")
+        let selected = notes.filter { ids.contains($0.id) }
+        let result = try await Task.detached(priority: .userInitiated) {
+            try NotebookExport.deliver(selected, from: item, using: settings, resolvedCitekey: resolved)
+        }.value
+        if let current = library.items.first(where: { $0.id == itemID }) {
+            var delivery = result.delivery
+            let prior = current.notebookDeliveries ?? []
+            if let recorded = prior.first(where: { $0.directory == delivery.directory && $0.file == delivery.file }) {
+                delivery.sent.formUnion(recorded.sent)
+            }
+            let updatedKey = current.zotero?.itemKey != nil && current.zotero?.itemKey == item.zotero?.itemKey
+                && current.zotero?.citationKey != resolved ? resolved : nil
+            if !prior.contains(delivery) || updatedKey != nil {
+                guard mutate(itemID, {
+                    $0.notebookDeliveries = prior.filter { $0.directory != delivery.directory } + [delivery]
+                    if let updatedKey { $0.zotero?.citationKey = updatedKey }
+                }) else {
+                    throw InputError.invalid("笔记已写入 Obsidian，漫读暂时无法保存发送回执。重试会核对笔记里的记录。")
+                }
             }
         }
         return result

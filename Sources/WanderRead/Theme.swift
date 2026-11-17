@@ -7,6 +7,7 @@ enum AppTheme:String,CaseIterable,Identifiable {
     var title:String {switch self {case .paper:return "纸间";case .tide:return "海盐";case .clay:return "陶土";case .lilac:return "暮紫";case .night:return "深夜"}}
     var detail:String {switch self {case .paper:return "暖纸与森林绿";case .tide:return "雾蓝与海岸线";case .clay:return "奶油与赤陶";case .lilac:return "浅紫与墨色";case .night:return "深蓝与月光"}}
     var isDark:Bool {self == .night}
+    var controlTint: Color { isDark ? Color(red: 0.64, green: 0.82, blue: 0.88) : color(4) }
     var colors:[UInt32] {switch self {
     case .paper:return [0xF7F5F0,0xEDF0E8,0x29362E,0x5C665C,0x335742,0xD1D9CC,0xE6ECDF,0xFFFFFF]
     case .tide:return [0xF1F6F8,0xE2ECF1,0x233D4B,0x526B79,0x28617A,0xC7D7DF,0xDCEAF0,0xFFFFFF]
@@ -17,12 +18,22 @@ enum AppTheme:String,CaseIterable,Identifiable {
     func color(_ index:Int)->Color {let n=colors[index];return Color(red:Double((n>>16)&255)/255,green:Double((n>>8)&255)/255,blue:Double(n&255)/255)}
 }
 enum Palette {
-    static var theme=AppTheme.paper
+    final class Selection: ObservableObject {
+        @Published var theme = AppTheme.paper
+    }
+
+    static let selection = Selection()
+    static var theme: AppTheme {
+        get { selection.theme }
+        set {
+            if newValue != selection.theme { selection.theme = newValue }
+        }
+    }
     static var paper:Color {theme.color(0)}
     static var side:Color {theme.color(1)}
     static var ink:Color {theme.color(2)}
     static var muted:Color {theme.color(3)}
-    static var green:Color {theme.isDark ? Color(red:0.64,green:0.82,blue:0.88):theme.color(4)}
+    static var green:Color {theme.controlTint}
     static var accent:Color {theme.color(4)}
     static var line:Color {theme.color(5)}
     static var card:Color {theme.color(6)}
@@ -33,11 +44,17 @@ extension ReadingStore {
         if commit({$0.preferences.appTheme=theme.rawValue}) {
             Palette.theme=theme
             ThemeAppIcon.apply(theme)
-            NSApp?.appearance=NSAppearance(named:theme.isDark ? .darkAqua:.aqua)
-            for window in NSApp?.windows ?? [] {window.appearance=NSAppearance(named:theme.isDark ? .darkAqua:.aqua);window.backgroundColor=NSColor(Palette.paper)}
+            // AppKit also owns status-bar, menu and popover windows in NSApp.windows.
+            // Painting all of them leaves an opaque theme-coloured tile in the menu bar.
+            for window in NSApp?.windows ?? [] where window is ReadingAppWindow {
+                window.appearance=NSAppearance(named:theme.isDark ? .darkAqua:.aqua)
+                window.backgroundColor=NSColor(Palette.paper)
+            }
         }
     }
 }
+
+class ReadingAppWindow: NSWindow {}
 
 struct ThemeAppIcon {
     static func image(_ theme:AppTheme)->NSImage {

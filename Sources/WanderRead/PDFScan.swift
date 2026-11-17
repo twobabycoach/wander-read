@@ -7,7 +7,7 @@ struct PDFScanClip: Codable, Equatable {
 }
 
 enum PDFScan {
-    static func image(of page: PDFPage, region: CGRect) throws -> Data {
+    static func image(of page: PDFPage, region: CGRect, masks: [CGRect]? = nil) throws -> Data {
         guard let source = page.pageRef else { throw InputError.invalid("无法取得这一页的图像。") }
         let crop = source.getBoxRect(.cropBox)
         let selected = region.standardized.intersection(crop)
@@ -18,7 +18,11 @@ enum PDFScan {
         let ratio = min(4, 1700 / max(selected.width, selected.height))
         let size = rotation == 0 ? crop.size : CGSize(width: crop.height, height: crop.width)
         let canvas = CGRect(origin: .zero, size: CGSize(width: size.width * ratio, height: size.height * ratio))
-        let transform = source.getDrawingTransform(.cropBox, rect: canvas, rotate: 0, preserveAspectRatio: true)
+        // CGPDFPageGetDrawingTransform can keep a small PDF at native scale when
+        // given a larger destination on macOS 13. Apply the raster scale explicitly.
+        let pageTransform = source.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: size),
+                                                       rotate: 0, preserveAspectRatio: true)
+        let transform = pageTransform.concatenating(CGAffineTransform(scaleX: ratio, y: ratio))
         let bounds = selected.applying(transform).standardized.integral.intersection(canvas.integral)
         guard !bounds.isNull, let context = CGContext(data: nil, width: Int(bounds.width), height: Int(bounds.height),
                     bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
@@ -29,6 +33,11 @@ enum PDFScan {
         context.fill(CGRect(origin: .zero, size: bounds.size))
         context.translateBy(x: -bounds.minX, y: -bounds.minY)
         context.concatenate(transform)
+        if let masks {
+            context.beginPath()
+            for mask in masks { context.addRect(mask) }
+            context.clip()
+        }
         context.drawPDFPage(source)
         guard let image = context.makeImage() else { throw InputError.invalid("未能保存选区图像。") }
         let bitmap = NSBitmapImageRep(cgImage: image)
@@ -67,6 +76,7 @@ extension PDFReader {
                                   lines: [PDFReadingLine(page: index, rect: selected)], quote: "", note: "")
         mark.isExcerpt = true
         mark.scan = PDFScanClip(jpeg: data)
+        mark.color = defaultMarkAppearance.color
         return save(mark) ? mark : nil
     }
 }

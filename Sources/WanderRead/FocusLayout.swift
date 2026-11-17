@@ -28,20 +28,36 @@ enum ReadingTint: String, Codable, CaseIterable, Identifiable {
 struct FocusLayout: Codable, Equatable {
     var width: Double = 720
     var notebookWidth: Double = 300
-    var textSize: Double = 17
-    var deskTint: ReadingTint = .sage
+    var textSize: Double = 18
+    var lineSpacing: Double?
+    var deskTint: ReadingTint = .theme
     var paperTint: ReadingTint = .linen
-    var noteTint: ReadingTint = .mist
+    var noteTint: ReadingTint = .theme
 
     var desk: Color { deskTint.color(Palette.side) }
     var paper: Color { paperTint.color(Palette.paper) }
     var notes: Color { noteTint.color(Palette.side) }
+    var paragraphLineSpacing: Double { lineSpacing ?? 9 }
 
     func normalized() -> Self {
         var result = self
         result.width = width.isFinite ? min(max(width, 440), 1200) : 720
         result.notebookWidth = notebookWidth.isFinite ? min(max(notebookWidth, 240), 420) : 300
-        result.textSize = textSize.isFinite ? min(max(textSize, 14), 26) : 17
+        result.textSize = textSize.isFinite ? min(max(textSize, 14), 26) : Self().textSize
+        if let lineSpacing { result.lineSpacing = lineSpacing.isFinite ? min(max(lineSpacing, 5), 16) : nil }
         return result
+    }
+}
+
+struct ReaderNotebookVisibility {
+    var standard = false
+    var focus = false
+
+    subscript(focused focused: Bool) -> Bool {
+        get { focused ? focus : standard }
+        set {
+            if focused { focus = newValue }
+            else { standard = newValue }
+        }
     }
 }

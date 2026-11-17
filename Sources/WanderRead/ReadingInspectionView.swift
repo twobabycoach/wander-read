@@ -43,16 +43,19 @@ struct ReadingInspectionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 7) {
-                Text(request.isCandidate ? "先看看" : "临时查阅")
-                    .font(.system(size: 11, weight: .semibold)).foregroundColor(Palette.green)
-                Text(request.item.title).font(.system(size: 22, weight: .medium, design: .serif)).lineLimit(2)
-                Text(request.sourceLabel).font(.system(size: 12)).foregroundColor(Palette.muted)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(request.isCandidate ? "先看看" : "临时查阅")
+                        .font(.system(size: 11, weight: .semibold)).foregroundColor(Palette.green)
+                    Spacer()
+                    Text(request.sourceLabel).font(.system(size: 11)).foregroundColor(Palette.muted)
+                }
+                Text(request.item.title).font(.system(size: 16, weight: .semibold)).lineLimit(2)
                 if !request.quote.isEmpty, case .pdf = content {
                     Text(ChineseReading.reflow(request.quote)).font(.system(size: 13))
                         .foregroundColor(Palette.muted).lineLimit(2).textSelection(.enabled)
                 }
-            }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 18).padding(.vertical, 13)
             Divider()
             detail.frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
@@ -61,12 +64,12 @@ struct ReadingInspectionView: View {
                     .font(.system(size: 12)).foregroundColor(Palette.muted)
                 Spacer()
                 Button(request.isCandidate ? "返回候选" : "关闭查阅") { store.inspection = nil }
-                    .buttonStyle(ActionStyle()).keyboardShortcut(.cancelAction)
+                    .buttonStyle(ReadingControlStyle()).keyboardShortcut(.cancelAction)
                 Button(request.isCandidate ? "就读这个" : "从这里继续读") {
                     store.acceptInspection(request, content: content)
-                }.buttonStyle(ActionStyle(primary: true))
+                }.buttonStyle(ReadingControlStyle(accented: true))
                     .disabled(!request.isCandidate && content == nil)
-            }.padding(18)
+            }.padding(.horizontal, 16).padding(.vertical, 9)
         }
         .frame(width: request.isCandidate ? 610 : 790, height: request.isCandidate ? 475 : 615)
         .foregroundColor(Palette.ink).background(Palette.paper)
@@ -86,7 +89,8 @@ struct ReadingInspectionView: View {
         switch content {
         case .pdf(_, let document, _, let destination):
             if let destination {
-                InspectionPDFCanvas(document: document, location: destination.location, lines: destination.lines)
+                InspectionPDFCanvas(document: document, location: destination.location, lines: destination.lines,
+                                    isRegion: request.isRegion)
                     .id(request.id).accessibilityLabel("原文预览")
             }
         case .text(_, let document, let offset):
@@ -144,32 +148,72 @@ private struct InspectionPDFCanvas: NSViewRepresentable {
     let document: PDFDocument
     let location: PDFReadingLocation
     let lines: [PDFReadingLine]
+    let isRegion: Bool
 
-    func makeNSView(context: Context) -> PDFView {
-        let view = PDFView()
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = LaidOutPDFView()
         view.backgroundColor = NSColor(Palette.side)
         view.displayMode = .singlePageContinuous
-        view.autoScales = true
         view.document = document
-        DispatchQueue.main.async { [weak view] in
-            guard let view, let page = document.page(at: location.page) else { return }
-            view.layoutDocumentView()
-            let selection = PDFSelection(document: document)
-            for line in lines where (0..<document.pageCount).contains(line.page) {
-                if let text = document.page(at: line.page)?.selection(for: line.rect) { selection.add(text) }
-            }
-            view.go(to: page)
-            if var point = location.point, point.x.isFinite, point.y.isFinite, view.scaleFactor > 0 {
-                point.y = min(page.bounds(for: .cropBox).maxY, point.y + view.bounds.height * 0.28 / view.scaleFactor)
-                view.go(to: PDFDestination(page: page, at: point))
-            }
-            if !selection.pages.isEmpty {
-                selection.color = NSColor.systemYellow.withAlphaComponent(0.55)
-                view.highlightedSelections = [selection]
+        view.autoScales = true
+        let marks = PDFHighlightSurface(pdf: view) { view in
+            let visible = Dictionary(uniqueKeysWithValues: view.visiblePages.map { (document.index(for: $0), $0) })
+            return lines.compactMap { line in
+                guard let page = visible[line.page] else { return nil }
+                return PDFCanvasHighlight(rect: view.convert(line.rect, from: page), isRegion: isRegion)
             }
         }
-        return view
+        let surface = NSView()
+        for child in [view as NSView, marks] {
+            child.frame = surface.bounds
+            child.autoresizingMask = [.width, .height]
+            surface.addSubview(child)
+        }
+        view.onFirstLayout = { [weak view, weak marks, weak coordinator = context.coordinator] in
+            guard let view, let page = document.page(at: location.page) else { return }
+            view.layoutDocumentView()
+            view.go(to: page)
+            if let point = location.point, point.x.isFinite, point.y.isFinite,
+               let scroll = view.documentView?.enclosingScrollView {
+                let clip = scroll.contentView
+                let target = clip.convert(view.convert(point, from: page), from: view)
+                var bounds = clip.bounds
+                bounds.origin.y = target.y - bounds.height * (clip.isFlipped ? 0.36 : 0.64)
+                if target.x < bounds.minX + 20 || target.x > bounds.maxX - 20 {
+                    bounds.origin.x = target.x - bounds.width / 2
+                }
+                clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+                scroll.reflectScrolledClipView(clip)
+            }
+            if let marks { coordinator?.observe(view, marks: marks); marks.needsDisplay = true }
+        }
+        return surface
     }
 
-    func updateNSView(_ view: PDFView, context: Context) {}
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    final class Coordinator {
+        private var observers: [NSObjectProtocol] = []
+
+        func observe(_ view: PDFView, marks: NSView) {
+            let center = NotificationCenter.default
+            for name in [Notification.Name.PDFViewVisiblePagesChanged, .PDFViewScaleChanged] {
+                observers.append(center.addObserver(forName: name, object: view, queue: .main) { [weak marks] _ in
+                    marks?.needsDisplay = true
+                })
+            }
+            if let clip = view.documentView?.enclosingScrollView?.contentView {
+                clip.postsBoundsChangedNotifications = true
+                observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak marks] _ in
+                    marks?.needsDisplay = true
+                })
+            }
+        }
+
+        deinit {
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        }
+    }
 }

@@ -1,12 +1,13 @@
 import AppKit
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     var window: NSWindow!
     var store: ReadingStore!
     var pendingURLs: [URL] = []
     var researchTimer:Timer?
     var glance: GlanceController?
+    private var escapeFocusMonitor: Any?
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
         let preview = args.contains("--preview")
@@ -15,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if preview && directory == nil { directory=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("WanderRead-preview-\(UUID().uuidString)") }
         store = ReadingStore(directory:directory,preview:preview)
         let compact = args.contains("--compact")
-        window = NSWindow(contentRect:NSRect(x:0,y:0,width:compact ? 1020 : 1220,height:compact ? 780 : 880),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        window = ReadingAppWindow(contentRect:NSRect(x:0,y:0,width:compact ? 1020 : 1220,height:compact ? 780 : 880),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.title = "漫读"; window.titlebarAppearsTransparent = true; window.backgroundColor = NSColor(Palette.paper); window.appearance=NSAppearance(named:Palette.theme.isDark ? .darkAqua:.aqua)
@@ -116,19 +117,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func application(_ application: NSApplication, open urls: [URL]) {
         guard store != nil else { pendingURLs.append(contentsOf:urls); return }
-        for url in urls {
-            if url.scheme == "wanderread" {
-                do {
-                    if url.host == "read" {
-                        store.revealReaderNote(try ReaderNoteLink(url))
-                    } else {
-                        let capture = try CaptureLink.parse(url)
-                        _ = store.add(title: capture.title, target: capture.target, note: "", tags: "", minutes: 15, difficulty: 2, interest: 3)
-                    }
+        let files = urls.filter(\.isFileURL)
+        if !files.isEmpty { store.importFiles(files) }
+        for url in urls where url.scheme == "wanderread" {
+            do {
+                if url.host == "read" {
+                    store.revealReaderNote(try ReaderNoteLink(url))
+                } else {
+                    let capture = try CaptureLink.parse(url)
+                    _ = store.add(title: capture.title, target: capture.target, note: "", tags: "", minutes: 15, difficulty: 2, interest: 3)
                 }
-                catch { store.error=error.localizedDescription }
-            }
-            else if url.isFileURL { store?.importFiles([url]) }
+            } catch { store.error=error.localizedDescription }
         }
         showMain()
     }
@@ -157,7 +156,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         saveReader() ? .terminateNow : .terminateCancel
     }
-    func applicationWillTerminate(_ notification: Notification) { store?.pauseOnQuit() }
+    func applicationWillTerminate(_ notification: Notification) {
+        if let escapeFocusMonitor { NSEvent.removeMonitor(escapeFocusMonitor) }
+        store?.pdfTranslationJobs.cancel()
+        LocalOllamaSession.stop()
+        store?.pauseOnQuit()
+    }
     func setupMenus() {
         let bar=NSMenu(); let appRoot=NSMenuItem(); bar.addItem(appRoot); let app=NSMenu(); appRoot.submenu=app
         app.addItem(withTitle:"关于漫读",action:#selector(about),keyEquivalent:"").target=self
@@ -173,6 +177,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle:"复制",action:#selector(NSText.copy(_:)),keyEquivalent:"c")
         edit.addItem(withTitle:"粘贴",action:#selector(NSText.paste(_:)),keyEquivalent:"v")
         edit.addItem(withTitle:"全选",action:#selector(NSText.selectAll(_:)),keyEquivalent:"a")
+        let readingRoot = NSMenuItem()
+        readingRoot.title = "阅读"
+        bar.addItem(readingRoot)
+        let readingMenu = NSMenu(title: "阅读")
+        readingRoot.submenu = readingMenu
+        let commands: [(String, String, ReadingCommand)] = [
+            ("摘录所选文字", "e", .excerpt), ("写批注", "n", .annotation), ("仅标记所选文字", "h", .highlight),
+            ("翻译所选文字", "t", .translate)
+        ]
+        for (title, key, command) in commands {
+            let item = readingMenu.addItem(withTitle: title, action: #selector(runReadingCommand(_:)), keyEquivalent: key)
+            item.tag = command.rawValue
+            item.keyEquivalentModifierMask = [.command, .shift]
+            item.target = self
+        }
         let viewRoot = NSMenuItem()
         viewRoot.title = "显示"
         bar.addItem(viewRoot)
@@ -185,12 +204,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         islandItem.keyEquivalentModifierMask = [.command, .shift]
         islandItem.target = self
         NSApp.mainMenu=bar
+        if let escapeFocusMonitor { NSEvent.removeMonitor(escapeFocusMonitor) }
+        escapeFocusMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53,
+                  event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+                  let window = self.window, event.window === window, window.isKeyWindow,
+                  window.attachedSheet == nil,
+                  !NSApp.windows.contains(where: { $0.isVisible && String(describing: type(of: $0)).contains("Popover") }),
+                  let store = self.store,
+                  !store.translationPanelOpen,
+                  store.pdfReader?.selectingRegion != true, store.pdfReader?.noteDraft == nil,
+                  store.textReader?.editing == nil, store.inspection == nil,
+                  (window.firstResponder as? NSTextView)?.isEditable != true else { return event }
+            guard store.pdfReader?.isFocused == true || store.textReader?.isFocused == true else { return event }
+            store.toggleReadingFocus()
+            return nil
+        }
     }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action != #selector(runReadingCommand(_:)) { return true }
+        guard let command = ReadingCommand(rawValue: menuItem.tag) else { return false }
+        return canRunReadingCommand(command)
+    }
+
+    private func canRunReadingCommand(_ command: ReadingCommand) -> Bool {
+        guard let store, let window, window.isKeyWindow, window.attachedSheet == nil else { return false }
+        if let reader = store.pdfReader {
+            return !reader.showOutline && !reader.selectingRegion && (command == .annotation || reader.hasSelection)
+        }
+        return command != .highlight && store.textReader?.selectedQuote != nil
+    }
+
+    @objc private func runReadingCommand(_ sender: NSMenuItem) {
+        guard let command = ReadingCommand(rawValue: sender.tag), canRunReadingCommand(command) else { return }
+        NotificationCenter.default.post(name: ReadingCommand.notification, object: store, userInfo: ["command": command])
+    }
+
     @objc func showGlance() { glance?.show() }
     @objc func toggleReadingFocus() { store?.toggleReadingFocus() }
     @objc func add() { NotificationCenter.default.post(name:Notification.Name("WanderAdd"),object:nil) }
     @objc func refresh() { NotificationCenter.default.post(name:Notification.Name("WanderRefresh"),object:nil) }
-    @objc func about() { NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"漫读",.applicationVersion:"0.9.0",.credits:NSAttributedString(string:"让好奇带路。\n指标与优先级设计参考 ebAobS 的漫游式渐进阅读。")]) }
+    @objc func about() { NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"漫读",.credits:NSAttributedString(string:"让好奇带路。\n指标与优先级设计参考 ebAobS 的漫游式渐进阅读。")]) }
 }
 
 @main struct WanderReadApp {

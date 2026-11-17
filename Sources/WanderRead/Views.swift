@@ -3,13 +3,38 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct ActionStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var enabled
     var primary = false
+
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label.font(.system(size:14,weight:.medium)).padding(.horizontal,18).padding(.vertical,12)
-            .foregroundColor(primary ? .white : Palette.ink)
-            .background(primary ? Palette.accent : Palette.surface.opacity(0.6))
-            .clipShape(RoundedRectangle(cornerRadius:10)).opacity(!enabled ? 0.4 : configuration.isPressed ? 0.7 : 1)
+        Surface(label: configuration.label, primary: primary, pressed: configuration.isPressed)
+    }
+
+    private struct Surface<Label: View>: View {
+        let label: Label
+        let primary: Bool
+        let pressed: Bool
+        @Environment(\.isEnabled) private var enabled
+        @ObservedObject private var appearance = Palette.selection
+        @State private var hovered = false
+
+        var body: some View {
+            let outline = RoundedRectangle(cornerRadius: 8)
+            let theme = appearance.theme
+            label.font(.system(size: 13, weight: primary ? .semibold : .medium))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .frame(minHeight: 34)
+                .foregroundColor(primary ? .white : theme.color(2))
+                .background(primary ? theme.color(4) : theme.color(7).opacity(0.82), in: outline)
+                .overlay {
+                    outline.fill(theme.color(2).opacity(enabled && (pressed || hovered) ? (pressed ? 0.13 : 0.055) : 0))
+                        .overlay { outline.strokeBorder(primary ? .clear : theme.color(5).opacity(0.7)) }
+                        .allowsHitTesting(false)
+                }
+                .contentShape(outline)
+                .onHover { hovered = $0 }
+                .opacity(enabled ? 1 : 0.44)
+        }
     }
 }
 
@@ -17,6 +42,8 @@ struct ReadingIconButton: View {
     let title: String
     let systemImage: String
     var size: CGFloat = 28
+    var selected = false
+    var accented = false
     let action: () -> Void
 
     var body: some View {
@@ -26,7 +53,7 @@ struct ReadingIconButton: View {
                 .frame(width: size, height: size)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.borderless)
+        .buttonStyle(ReadingControlStyle(selected: selected, accented: accented, horizontalPadding: 0))
         .help(title)
         .accessibilityLabel(title)
     }
@@ -110,42 +137,98 @@ struct MainView: View {
             .onReceive(NotificationCenter.default.publisher(for:Notification.Name("WanderRefresh"))) { _ in if store.page == "发现" && store.activeSession == nil { store.refresh() } }
     }
     var sidebar: some View {
-        VStack(alignment:.leading,spacing:0) {
-            HStack(spacing:12) { OrbitMark(); VStack(alignment:.leading,spacing:3) { Text("漫读").font(.system(size:24,weight:.semibold,design:.serif)); Text("阅读注意力管理").font(.system(size:11)).foregroundColor(Palette.muted) } }.padding(.top,35).padding(.bottom,36)
-            ForEach([("发现","sparkle"),("收藏","tray"),("策略","slider.horizontal.3"),("回顾","chart.xyaxis.line"),("里程","seal")],id:\.0) { name, icon in
-                Button { store.page = name } label: { HStack(spacing:12) { Image(systemName:icon).frame(width:20); Text(name); Spacer(); if store.page == name { Circle().fill(Palette.green).frame(width:5,height:5) } }.padding(.horizontal,14).padding(.vertical,14).background(store.page == name ? Palette.surface.opacity(0.65) : .clear).cornerRadius(10) }.buttonStyle(.plain).padding(.bottom,6)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 9) {
+                OrbitMark(size: 27)
+                Text("漫读").font(.system(size: 21, weight: .semibold, design: .serif))
+            }.padding(.leading, 8).padding(.top, 20).padding(.bottom, 20)
+            ForEach([("发现", "sparkle"), ("收藏", "tray"), ("策略", "slider.horizontal.3"),
+                     ("回顾", "chart.xyaxis.line"), ("里程", "seal")], id: \.0) { name, icon in
+                sidebarLink(name, icon: icon, page: name)
             }
             Spacer()
-            VStack(alignment:.leading,spacing:8) { Text("不必全都读完。").font(.system(size:13,weight:.medium)); Text("愿意停留的那一篇，\n就从这里开始。").font(.system(size:12)).foregroundColor(Palette.muted).lineSpacing(5) }.padding(.horizontal,10).padding(.bottom,30)
-            Divider().overlay(Palette.line)
-            Button { store.page = "偏好" } label: { Label("偏好与数据",systemImage:"slider.horizontal.3").font(.system(size:13)).padding(.vertical,20) }.buttonStyle(.plain)
-            Label("保存在这台 Mac",systemImage:"internaldrive").font(.system(size:10)).foregroundColor(Palette.muted).padding(.bottom,22)
-        }.padding(.horizontal,20).frame(width:204).background(Palette.side)
+            Divider().overlay(Palette.line.opacity(0.6)).padding(.bottom, 5)
+            sidebarLink("偏好与数据", icon: "gearshape", page: "偏好")
+            Label("保存在这台 Mac", systemImage: "internaldrive")
+                .font(.system(size: 10)).foregroundColor(Palette.muted).padding(.leading, 8)
+                .padding(.top, 5).padding(.bottom, 16)
+        }.padding(.horizontal, 12).frame(width: 166).background(Palette.side.opacity(0.68))
+            .overlay(alignment: .trailing) { Rectangle().fill(Palette.line.opacity(0.6)).frame(width: 1) }
     }
+
+    private func sidebarLink(_ title: String, icon: String, page: String) -> some View {
+        Button { store.page = page } label: {
+            HStack(spacing: 7) {
+                Image(systemName: icon).frame(width: 17)
+                Text(title)
+            }.frame(maxWidth: .infinity, minHeight: 31, alignment: .leading)
+                .foregroundColor(store.page == page ? Palette.green : Palette.ink)
+        }.buttonStyle(ReadingControlStyle(selected: store.page == page))
+    }
+
     var topbar: some View {
-        HStack {
-            Text(store.isPreview ? "独立示例预览 · 不写入个人资料" : store.page == "发现" ? "留一点时间，给意料之外" : store.page).font(.system(size:12)).foregroundColor(Palette.muted)
+        HStack(spacing: 7) {
+            Text(store.isPreview ? "示例预览" : store.page == "偏好" ? "偏好与数据" : store.page)
+                .font(.system(size: 12, weight: .medium)).foregroundColor(Palette.muted)
             Spacer()
             if store.activeSession == nil && (store.page == "发现" || store.page == "收藏") {
                 Button { related = true } label: { Label("相似度榜", systemImage: "list.number") }
-                    .buttonStyle(ActionStyle())
+                    .buttonStyle(ReadingControlStyle())
             }
             if store.page == "发现" && store.activeSession == nil && !store.previousRecommendations.isEmpty {
-                Button("上一批", action: store.returnToPreviousBatch).buttonStyle(ActionStyle())
+                Button("上一批", action: store.returnToPreviousBatch).buttonStyle(ReadingControlStyle())
             }
             if store.page == "发现" && store.activeSession == nil && !store.recommendations.isEmpty {
-                Button { withAnimation(reduceMotion ? nil : .easeOut(duration:0.18)) { store.refresh() } } label:{ Label(store.viewingPreviousBatch ? "下一批" : "换一批",systemImage:"arrow.triangle.2.circlepath") }.buttonStyle(ActionStyle()).keyboardShortcut("r",modifiers:.command)
+                Button { withAnimation(reduceMotion ? nil : .easeOut(duration:0.18)) { store.refresh() } } label:{ Label(store.viewingPreviousBatch ? "下一批" : "换一批",systemImage:"arrow.triangle.2.circlepath") }.buttonStyle(ReadingControlStyle()).keyboardShortcut("r",modifiers:.command)
             }
-            Menu { Button("添加本地文件…",action:store.pickFiles); Button("从 Obsidian 仓库收录…",action:store.importObsidian); Button("从 Zotero 收录…") { zoteroImport = true } } label: { Image(systemName:"square.and.arrow.down").font(.system(size:16)) }.menuStyle(.borderlessButton).frame(width:30).help("收录本地内容")
-            Button { adding = true } label:{ Label("收下一篇",systemImage:"plus") }.buttonStyle(ActionStyle()).keyboardShortcut("n",modifiers:.command)
-        }.padding(.horizontal,36).padding(.vertical,16).overlay(alignment:.bottom) { Rectangle().fill(Palette.line.opacity(0.6)).frame(height:1) }
+            Menu { Button("添加本地文件…",action:store.pickFiles); Button("从 Obsidian 仓库收录…",action:store.importObsidian); Button("从 Zotero 收录…") { zoteroImport = true } } label: { Image(systemName:"square.and.arrow.down") }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width:28).help("收录本地内容").accessibilityLabel("收录本地内容")
+            Button { adding = true } label:{ Label("收下一篇",systemImage:"plus") }.buttonStyle(ReadingControlStyle(accented: true)).keyboardShortcut("n",modifiers:.command)
+        }.padding(.horizontal,23).padding(.vertical,8).overlay(alignment:.bottom) { Rectangle().fill(Palette.line.opacity(0.6)).frame(height:1) }
     }
+    private var discoveryOptions: some View {
+        let preferences = store.library.preferences
+        return HStack(spacing: 12) {
+            Menu {
+                Picker("此刻的状态", selection: Binding(get: { preferences.energy },
+                    set: { value in store.updatePreferences({ $0.energy = value }, redraw: true) })) {
+                    ForEach(Energy.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+            } label: { Label(preferences.energy.title, systemImage: "sun.haze") }
+                .fixedSize()
+                .accessibilityLabel("此刻的状态").accessibilityValue(preferences.energy.title)
+            Menu {
+                Picker("停留时间", selection: Binding(get: { preferences.slice },
+                    set: { value in store.updatePreferences({ $0.slice = value }, redraw: true) })) {
+                    ForEach([5, 15, 30], id: \.self) { Text("\($0) 分钟").tag($0) }
+                }
+            } label: { Label("\(preferences.slice) 分钟", systemImage: "clock") }
+                .fixedSize()
+                .accessibilityLabel("停留时间").accessibilityValue("\(preferences.slice) 分钟")
+            Menu {
+                Picker("推荐策略", selection: Binding(get: { preferences.strategy.id }, set: store.selectStrategy)) {
+                    ForEach(preferences.allStrategies) { Text($0.name).tag($0.id) }
+                }
+                Divider()
+                Button("调整策略与范围…") { store.page = "策略" }
+            } label: {
+                Label(preferences.strategy.name, systemImage: "slider.horizontal.3")
+                    .lineLimit(1).frame(maxWidth: 144)
+            }.fixedSize()
+                .accessibilityLabel("推荐策略").accessibilityValue(preferences.strategy.name)
+            if !preferences.strategy.scopeTag.isEmpty {
+                Label(preferences.strategy.scopeTag, systemImage: "tag")
+                    .lineLimit(1).font(.system(size: 11)).help("当前范围 · " + preferences.strategy.scopeTag)
+            }
+            Spacer(minLength: 0)
+        }.font(.system(size: 12, weight: .medium)).foregroundColor(Palette.muted)
+            .menuStyle(.borderlessButton)
+    }
+
     var discovery: some View {
         VStack(alignment:.leading,spacing:20) {
             if store.activeSession != nil { activeVisit }
             else {
                 VStack(alignment:.leading,spacing:10) {
-                    Text("随 心 遇 见").font(.system(size:11,weight:.semibold)).foregroundColor(Palette.green)
                     Text("今天，什么让你好奇？").font(.system(size:34,weight:.medium,design:.serif))
                     Text("随便看看。遇到想读的，再停下来。").font(.system(size:14)).foregroundColor(Palette.muted)
                 }
@@ -165,18 +248,7 @@ struct MainView: View {
                         Button("接着读") { store.openInReader(item) }.buttonStyle(ActionStyle())
                     }.padding(12).background(Palette.side.opacity(0.7)).cornerRadius(10)
                 }
-                HStack(spacing:20) {
-                    HStack(spacing:6) { Image(systemName:"sun.haze").foregroundColor(Palette.muted); Picker("此刻的状态",selection:Binding(get:{store.library.preferences.energy},set:{ v in store.updatePreferences({$0.energy=v},redraw:true) })) { ForEach(Energy.allCases,id:\.self) { Text($0.title).tag($0) } }.labelsHidden().frame(width:140) }
-                    Rectangle().fill(Palette.line).frame(width:1,height:20)
-                    HStack { Text("先留").font(.system(size:12)).foregroundColor(Palette.muted); Picker("这次想停留多久",selection:Binding(get:{store.library.preferences.slice},set:{v in store.updatePreferences({$0.slice=v},redraw:true)})) { ForEach([5,15,30],id:\.self) { Text("\($0) 分钟").tag($0) } }.labelsHidden().frame(width:100) }
-                    Spacer()
-                    Text("随时可以改变主意").font(.system(size:11)).foregroundColor(Palette.muted)
-                }
-                HStack(spacing:8) {
-                    Picker("推荐策略",selection:Binding(get:{store.library.preferences.strategy.id},set:{store.selectStrategy($0)})) {ForEach(store.library.preferences.allStrategies) {Text($0.name).tag($0.id)}}.frame(width:205)
-                    if !store.library.preferences.strategy.scopeTag.isEmpty {Text("范围："+store.library.preferences.strategy.scopeTag).font(.system(size:11)).foregroundColor(Palette.muted)}
-                    Spacer(); Button("调整策略与范围") {store.page="策略"}.buttonStyle(.plain).font(.system(size:11)).foregroundColor(Palette.green)
-                }
+                discoveryOptions
                 if let first = store.recommendations.first {
                     hero(first)
                     if store.recommendations.count > 1 {
@@ -297,8 +369,13 @@ struct MainView: View {
     var collection: some View {
         VStack(alignment:.leading,spacing:24) {
             Text("把好奇留下来。").font(.system(size:32,weight:.medium,design:.serif))
-            Text("这里是可以回来找的地方，不是一份待办清单。").font(.system(size:14)).foregroundColor(Palette.muted)
-            HStack {Button("批量管理") {managing=true}.buttonStyle(ActionStyle()); Picker("收藏状态",selection:$filter) { ForEach(["全部","可遇见","休息中","已归档"],id:\.self) { Text($0).tag($0) } }.pickerStyle(.segmented).frame(maxWidth:370); Spacer(); TextField("搜索标题、主题",text:$search).textFieldStyle(.roundedBorder).frame(width:210) }
+            HStack(spacing: 8) {
+                ReadingTabs(selection: $filter, options: ["全部", "可遇见", "休息中", "已归档"].map { ($0, $0) })
+                Spacer(minLength: 8)
+                ReadingSearchField(prompt: "搜索标题、主题", query: $search).frame(width: 200)
+                Button { managing = true } label: { Label("批量管理", systemImage: "checklist") }
+                    .buttonStyle(ReadingControlStyle())
+            }
             if store.importing { ProgressView("正在收录笔记位置…") }
             if filteredItems.isEmpty { Text(search.isEmpty ? "这里还没有内容。用右上角的“收下一篇”开始。" : "没有找到相关内容。").foregroundColor(Palette.muted).padding(.vertical,40) }
             LazyVStack(spacing:0) { ForEach(filteredItems) { item in
@@ -308,9 +385,9 @@ struct MainView: View {
                         Text("\(item.primaryTag)  ·  \(item.source)  ·  \(item.state == .archived ? "已归档" : (item.snoozedUntil ?? .distantPast) > Date() ? "休息中" : "可遇见")\(item.isDemo ? "  ·  示例" : "")").font(.system(size:11)).foregroundColor(Palette.muted)
                         if !item.bookmark.isEmpty { Text("停在：\(item.bookmark)").font(.system(size:12)).foregroundColor(Palette.muted) }
                     }; Spacer()
-                    Button("打开") { store.choose(item) }.buttonStyle(ActionStyle())
-                    Menu { if item.canReadInside {Button("用原应用打开") {store.choose(item, external: true)}}; if item.canSendToResearch {Button("交给研贴摘录") {store.sendToResearch(item)}}; if item.researchNoteURL != nil {Button("查看已存摘录") {store.openResearchNote(item)}; Button("在 Obsidian 复习") {store.openResearchNote(item,review:true)}}; Button("指标与优先级") {metricItem=item}; Button("编辑资料") { editItem = item }; if item.state == .archived || (item.snoozedUntil ?? .distantPast) > Date() { Button("放回可遇见") { store.restore(item.id) } }; if item.state != .archived { Button("先放一放") { store.snooze(item.id) }; Button("放入归档") { store.archive(item.id) } } } label: { Image(systemName:"ellipsis").frame(width:24,height:36) }.menuStyle(.borderlessButton).frame(width:30).accessibilityLabel("管理 \(item.title)")
-                }.padding(.vertical,20)
+                    Button("打开") { store.choose(item) }.buttonStyle(ReadingControlStyle())
+                    Menu { if item.canReadInside {Button("用原应用打开") {store.choose(item, external: true)}}; if item.canSendToResearch {Button("交给研贴摘录") {store.sendToResearch(item)}}; if item.researchNoteURL != nil {Button("查看已存摘录") {store.openResearchNote(item)}; Button("在 Obsidian 复习") {store.openResearchNote(item,review:true)}}; Button("指标与优先级") {metricItem=item}; Button("编辑资料") { editItem = item }; if item.state == .archived || (item.snoozedUntil ?? .distantPast) > Date() { Button("放回可遇见") { store.restore(item.id) } }; if item.state != .archived { Button("先放一放") { store.snooze(item.id) }; Button("放入归档") { store.archive(item.id) } } } label: { Image(systemName:"ellipsis").frame(width:24,height:30) }.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width:28).accessibilityLabel("管理 \(item.title)")
+                }.padding(.vertical,14)
                 Divider().overlay(Palette.line.opacity(0.5))
             } }
         }
@@ -331,51 +408,83 @@ struct MainView: View {
         }
     }
     var preferences: some View {
-        VStack(alignment:.leading,spacing:26) {
-            Text("留一点余地。").font(.system(size:32,weight:.medium,design:.serif))
-            Text("让推荐贴近此刻，也保留走向陌生内容的机会。").font(.system(size:14)).foregroundColor(Palette.muted)
+        VStack(alignment:.leading,spacing:20) {
             ThemeChooser(store:store)
-            GlanceSettings(store: store).padding(24).background(Palette.surface.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
-            VStack(alignment:.leading,spacing:16) {
-                HStack { Text("探索的份量").font(.system(size:16,weight:.medium)); Spacer(); Text("\(Int(store.library.preferences.exploration*100))%").monospacedDigit().foregroundColor(Palette.green) }
+            Divider()
+            GlanceSettings(store: store)
+            Divider()
+            VStack(alignment:.leading,spacing:11) {
+                HStack { Text("探索的份量").font(.system(size:16,weight:.semibold)); Spacer(); Text("\(Int(store.library.preferences.exploration*100))%").monospacedDigit().foregroundColor(Palette.green) }
                 Slider(value:Binding(get:{store.library.preferences.exploration},set:{v in store.updatePreferences { $0.exploration = v }}),in:0...1,step:0.05).tint(Palette.green).accessibilityLabel("随机探索比例")
                 HStack { Text("顺着兴趣走"); Spacer(); Text("多些意料之外") }.font(.system(size:12)).foregroundColor(Palette.muted)
                 Text("探索时减少兴趣权重，让不熟悉的内容也有机会出现。每一轮不重复，换一批不会降低兴趣。精力与时间只是推荐参考，长文仍可以被选中。").font(.system(size:13)).foregroundColor(Palette.muted).lineSpacing(5).fixedSize(horizontal:false,vertical:true)
-            }.padding(24).background(Palette.surface.opacity(0.55)).cornerRadius(14)
-            VStack(alignment:.leading,spacing:14) {
-                Text("把现有的阅读工具接进来").font(.system(size:17,weight:.medium))
-                Text("PDF、Markdown、纯文本、HTML 和 RTF 可以直接读。也可从收藏用原应用打开。").font(.system(size:13)).foregroundColor(Palette.muted).lineSpacing(5).fixedSize(horizontal:false,vertical:true)
-                HStack { Button("收录本地文件…",action:store.pickFiles).buttonStyle(ActionStyle()); Button("收录 Obsidian 仓库…",action:store.importObsidian).buttonStyle(ActionStyle()).disabled(store.importing); Button("从 Zotero 收录…") { zoteroImport = true }.buttonStyle(ActionStyle()) }
-                Button("Obsidian 收件与模板…") { notebookSetup = true }.buttonStyle(ActionStyle())
-                Button("复制浏览器收藏脚本") {
-                    let script = "javascript:(()=>{location.href='wanderread://add?url='+encodeURIComponent(location.href)+'&title='+encodeURIComponent(document.title)})()"
-                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(script,forType:.string); store.message = "已复制。新建浏览器书签，把脚本粘到网址栏；浏览网页时点这个书签即可收下。"
-                }.buttonStyle(.plain).font(.system(size:12)).foregroundColor(Palette.green)
-                Text("Obsidian 请选择仓库根目录；笔记新增后可再次收录，会自动跳过重复位置。移动或改名的笔记需更新入口。").font(.system(size:11)).foregroundColor(Palette.muted)
             }
             Divider()
             VStack(alignment:.leading,spacing:14) {
-                Text("资料由你保管").font(.system(size:17,weight:.medium))
-                Button("管理导入与回收站…") {managing=true}.buttonStyle(ActionStyle())
+                Text("收录与联动").font(.system(size:16,weight:.semibold))
+                Text("PDF、Markdown、纯文本、HTML 和 RTF 可以直接读。也可从收藏用原应用打开。").font(.system(size:13)).foregroundColor(Palette.muted).lineSpacing(5).fixedSize(horizontal:false,vertical:true)
+                HStack(spacing: 8) {
+                    Button("收录本地文件…", action: store.pickFiles)
+                    Button("从 Obsidian 收录…", action: store.importObsidian).disabled(store.importing)
+                    Button("从 Zotero 收录…") { zoteroImport = true }
+                    Button("复制浏览器收藏脚本") {
+                        let script = "javascript:(()=>{location.href='wanderread://add?url='+encodeURIComponent(location.href)+'&title='+encodeURIComponent(document.title)})()"
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(script, forType: .string)
+                        store.message = "已复制。新建浏览器书签，把脚本粘到网址栏。浏览网页时点这个书签即可收下。"
+                    }.help("复制到剪贴板")
+                }.buttonStyle(ReadingControlStyle())
+                HStack(spacing: 11) {
+                    Image(systemName: "paperplane").foregroundColor(Palette.green).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("将摘录送到 Obsidian").font(.system(size: 13, weight: .semibold))
+                        if let settings = store.library.preferences.notebookExport {
+                            let vault = URL(fileURLWithPath: settings.vault).lastPathComponent
+                            let folder = settings.folder.trimmingCharacters(in: .whitespacesAndNewlines)
+                            Text(folder.isEmpty ? vault : vault + " / " + folder)
+                                .font(.system(size: 12)).foregroundColor(Palette.muted).lineLimit(1).truncationMode(.middle)
+                        } else {
+                            Text("选择收件仓库和文件夹").font(.system(size: 12)).foregroundColor(Palette.muted)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Button("收件设置…") { notebookSetup = true }.buttonStyle(ReadingControlStyle(accented: true))
+                }
+                .padding(10).background(Palette.surface.opacity(0.52), in: RoundedRectangle(cornerRadius: 8))
+            }
+            Divider()
+            VStack(alignment:.leading,spacing:14) {
+                Text("资料与备份").font(.system(size:16,weight:.semibold))
+                Button("管理导入与回收站…") {managing=true}.buttonStyle(ReadingControlStyle())
                 Text("导错的内容可按批次或逐篇移入回收站，随时恢复；不会删除原文件或 Obsidian 笔记。").font(.system(size:12)).foregroundColor(Palette.muted)
-                HStack { Button("导出备份…",action:store.exportBackup).buttonStyle(ActionStyle()); Button("从备份恢复…",action:store.importBackup).buttonStyle(ActionStyle()); Button("查看资料文件") { NSWorkspace.shared.activateFileViewerSelecting([store.dataURL]) }.buttonStyle(.plain).font(.system(size:12)) }
+                HStack { Button("导出备份…",action:store.exportBackup); Button("从备份恢复…",action:store.importBackup); Button("查看资料文件") { NSWorkspace.shared.activateFileViewerSelecting([store.dataURL]) } }
+                    .buttonStyle(ReadingControlStyle())
                 Text("离线可用，无账号。收藏和偏好保存在 ~/Library/Application Support/WanderRead/library.json，每次保存保留上一版 .bak。").font(.system(size:11)).foregroundColor(Palette.muted).textSelection(.enabled).lineSpacing(5)
                 HStack { Button("加入示例入口",action:store.loadDemo).buttonStyle(.plain); if store.library.items.contains(where:{$0.isDemo}) { Button("移除示例及其足迹",action:store.removeDemo).buttonStyle(.plain).disabled(store.activeItem?.isDemo == true) } }.font(.system(size:12)).foregroundColor(Palette.green)
             }
-            Text("漫读 0.9.0  ·  从收藏接上原文与想法。").font(.system(size:11)).foregroundColor(Palette.muted)
+            if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                Text("漫读 \(version)").font(.system(size: 11)).foregroundColor(Palette.muted)
+            }
         }
     }
     func drop(_ providers: [NSItemProvider]) -> Bool {
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                provider.loadItem(forTypeIdentifier:UTType.fileURL.identifier,options:nil) { item,_ in
-                    let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation:$0,relativeTo:nil) }
-                    if let url = url { DispatchQueue.main.async { store.importFiles([url]) } }
+        let requests = providers.compactMap { provider -> (NSItemProvider, String)? in
+            let supported = [UTType.fileURL, .url].first { provider.hasItemConformingToTypeIdentifier($0.identifier) }
+            return supported.map { (provider, $0.identifier) }
+        }
+        guard !requests.isEmpty else { return false }
+        Task { @MainActor in
+            var urls: [URL] = []
+            for (provider, type) in requests {
+                let url: URL? = await withCheckedContinuation { continuation in
+                    provider.loadItem(forTypeIdentifier: type, options: nil) { item, _ in
+                        let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                        continuation.resume(returning: url)
+                    }
                 }
-            } else { provider.loadItem(forTypeIdentifier:UTType.url.identifier,options:nil) { item,_ in
-                let url = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation:$0,relativeTo:nil) }
-                if let url = url { DispatchQueue.main.async { _ = store.add(title:url.host ?? url.absoluteString,target:url.absoluteString,note:"",tags:"",minutes:15,difficulty:2,interest:3) } }
-            } }
+                if let url { urls.append(url) }
+            }
+            store.importEntries(urls, unreadable: providers.count - urls.count)
         }
         return true
     }
@@ -393,22 +502,84 @@ struct ItemForm: View {
     @State private var difficulty = 2
     @State private var interest = 3.0
     @State private var validation = ""
+    @State private var showDetails = false
+    @FocusState private var targetFocused: Bool
+    private var suggestedTitle: String? { item == nil ? Targets.suggestedTitle(target) : nil }
+
     var body: some View {
-        VStack(alignment:.leading,spacing:20) {
-            Text(item == nil ? "先收下，等好奇回来。" : "留下更合适的入口。").font(.system(size:25,weight:.medium,design:.serif))
-            Text("只需标题和入口，其他都可以以后再说。").font(.system(size:13)).foregroundColor(Palette.muted)
-            VStack(alignment:.leading,spacing:7) { Text("标题"); TextField("下次看到时，能认出它",text:$title).textFieldStyle(.roundedBorder) }
-            VStack(alignment:.leading,spacing:7) { Text("网址、文件路径或应用链接"); TextField("https://… 或 obsidian://open?…",text:$target).textFieldStyle(.roundedBorder); Button("选择本地文件…") { let p=NSOpenPanel(); if p.runModal() == .OK, let u=p.url { target=u.path; if title.isEmpty { title=u.deletingPathExtension().lastPathComponent } } }.buttonStyle(.plain).font(.system(size:12)).foregroundColor(Palette.green).padding(.top,4) }
-            VStack(alignment:.leading,spacing:7) { Text("为什么想读（可选）"); TextField("给未来的自己留一点好奇",text:$note).textFieldStyle(.roundedBorder) }
-            VStack(alignment:.leading,spacing:7) { Text("主题（可选，用逗号分隔）"); TextField("哲学，生活，偶然发现",text:$tags).textFieldStyle(.roundedBorder) }
-            HStack(spacing:24) { Stepper("大约 \(minutes) 分钟",value:$minutes,in:1...600,step:5).frame(width:180); Picker("深浅",selection:$difficulty) { Text("轻松").tag(1); Text("适中").tag(2); Text("烧脑").tag(3) }.frame(width:210) }
-            HStack { Text("此刻的兴趣"); Slider(value:$interest,in:1...5,step:1).tint(Palette.green); Text("\(Int(interest))/5").monospacedDigit() }
+        VStack(alignment: .leading, spacing: 18) {
+            Text(item == nil ? "收下一篇" : "编辑资料").font(.system(size: 25, weight: .medium, design: .serif))
+            VStack(alignment: .leading, spacing: 7) {
+                Text("入口")
+                TextField("网址、文件路径或应用链接", text: $target)
+                    .textFieldStyle(.roundedBorder).focused($targetFocused)
+                HStack(spacing: 13) {
+                    Button("粘贴链接", action: pasteLink)
+                    Button("选择文件…", action: chooseFile)
+                }.buttonStyle(.borderless).font(.system(size: 12)).foregroundColor(Palette.green)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text("标题")
+                TextField(suggestedTitle ?? "下次看到时，能认出它", text: $title).textFieldStyle(.roundedBorder)
+            }
+            DisclosureGroup("备注与阅读设置", isExpanded: $showDetails) {
+                VStack(alignment: .leading, spacing: 12) {
+                    TextField("为什么想读", text: $note).textFieldStyle(.roundedBorder)
+                    TextField("主题（逗号分隔）", text: $tags).textFieldStyle(.roundedBorder)
+                    HStack(spacing: 14) {
+                        Stepper("约 \(minutes) 分钟", value: $minutes, in: 1...600, step: 5)
+                        Picker("深浅", selection: $difficulty) {
+                            Text("轻松").tag(1); Text("适中").tag(2); Text("烧脑").tag(3)
+                        }.frame(width: 130)
+                    }
+                    HStack {
+                        Text("此刻的兴趣")
+                        Slider(value: $interest, in: 1...5, step: 1).tint(Palette.green)
+                        Text("\(Int(interest))/5").monospacedDigit()
+                    }
+                }.padding(.top, 10)
+            }
             if !validation.isEmpty { Text(validation).font(.system(size:12)).foregroundColor(.red) }
-            HStack { Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).buttonStyle(ActionStyle()); Spacer(); if item == nil { Button("从剪贴板粘贴链接") { if let s=NSPasteboard.general.string(forType:.string) { target=s; if title.isEmpty { title=URL(string:s)?.host ?? "" } } }.buttonStyle(.plain).font(.system(size:12)).foregroundColor(Palette.green) }; Button("收下") {
-                if store.add(title:title,target:target,note:note,tags:tags,minutes:minutes,difficulty:difficulty,interest:interest,editing:item?.id) { dismiss() } else { validation=store.error ?? "未能保存"; store.error=nil }
-            }.keyboardShortcut(.defaultAction).buttonStyle(ActionStyle(primary:true)) }
-        }.font(.system(size:13)).padding(32).frame(width:540).background(Palette.paper).foregroundColor(Palette.ink).onAppear {
-            if let i=item { title=i.title; target=i.target; note=i.note; tags=i.tags.joined(separator:"，"); minutes=i.minutes; difficulty=i.difficulty; interest=i.interest }
+            HStack {
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).buttonStyle(ActionStyle())
+                Spacer()
+                Button(item == nil ? "收下" : "保存", action: save)
+                    .keyboardShortcut(.defaultAction).buttonStyle(ActionStyle(primary: true))
+                    .disabled(target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .font(.system(size: 13)).padding(28).frame(width: 505).background(Palette.paper).foregroundColor(Palette.ink)
+        .onAppear {
+            if let item {
+                title = item.title; target = item.target; note = item.note; tags = item.tags.joined(separator: "，")
+                minutes = item.minutes; difficulty = item.difficulty; interest = item.interest
+            } else { targetFocused = true }
+        }
+        .onChange(of: target) { _ in validation = "" }
+    }
+
+    private func pasteLink() {
+        guard let value = NSPasteboard.general.string(forType: .string), let normalized = try? Targets.normalize(value) else {
+            validation = "剪贴板里没有可收录的链接或路径。"
+            return
+        }
+        target = normalized
+        validation = ""
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        if panel.runModal() == .OK, let url = panel.url { target = url.path }
+    }
+
+    private func save() {
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? (suggestedTitle ?? title) : title
+        if store.add(title: name, target: target, note: note, tags: tags, minutes: minutes,
+                     difficulty: difficulty, interest: interest, editing: item?.id) {
+            dismiss()
+        } else {
+            validation = store.error ?? "未能保存。"
+            store.error = nil
         }
     }
 }

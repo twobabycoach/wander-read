@@ -13,7 +13,14 @@ enum PDFFoldUnit: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+struct PDFFoldOptions: Codable, Equatable {
+    var unit: PDFFoldUnit = .chapter
+    var pages = 3
+    var fullPassages = false
+}
+
 struct PDFChapter: Identifiable {
+    static let batchSize = 8
     let id: Int
     let title: String
     let start: PDFReadingLocation
@@ -23,6 +30,12 @@ struct PDFChapter: Identifiable {
     func pages(total: Int) -> Range<Int> {
         let exclusive = end.map { $0.page + ($0.point == nil ? 0 : 1) } ?? total
         return start.page..<min(total, max(start.page + 1, exclusive))
+    }
+
+    func initialPages(around page: Int, total: Int) -> Range<Int> {
+        let available = pages(total: total)
+        let start = available.contains(page) ? max(available.lowerBound, page - 1) : available.lowerBound
+        return start..<min(available.upperBound, start + Self.batchSize)
     }
 
     func pageLabel(total: Int) -> String {
@@ -99,11 +112,156 @@ struct PDFTextLine {
     }
 }
 
+struct PDFSentenceHit {
+    let id = UUID()
+    let page: PDFPage
+    let text: String
+    let selections: [PDFSelection]
+    let suspectedEncodingError: Bool
+}
+
 extension PDFPage {
     func textSelection(in range: NSRange) -> PDFSelection? {
         let length = numberOfCharacters
         guard range.length > 0, range.location >= 0, range.location < length, range.length <= length - range.location else { return nil }
         return selection(for: range)
+    }
+
+    func sentence(at point: CGPoint) -> PDFSentenceHit? {
+        textHit(at: point, wholeParagraph: false, nearby: false)
+    }
+
+    func paragraph(at point: CGPoint, nearby: Bool = false) -> PDFSentenceHit? {
+        textHit(at: point, wholeParagraph: true, nearby: nearby)
+    }
+
+    func correspondingPoint(_ point: CGPoint, from other: PDFPage) -> CGPoint? {
+        guard rotation == other.rotation else { return nil }
+        let frame = bounds(for: .cropBox), origin = other.bounds(for: .cropBox)
+        guard !origin.isEmpty, !frame.isEmpty, origin.contains(point) else { return nil }
+        return CGPoint(x: frame.minX + (point.x - origin.minX) * frame.width / origin.width,
+                       y: frame.minY + (point.y - origin.minY) * frame.height / origin.height)
+    }
+
+    private func textHit(at point: CGPoint, wholeParagraph: Bool, nearby allowNearby: Bool) -> PDFSentenceHit? {
+        guard let value = string, !annotations.contains(where: { $0.type == "Link" && $0.bounds.contains(point) }) else { return nil }
+        let source = value as NSString
+        let charIndex = characterIndex(at: point)
+        let offset = charIndex >= 0 && charIndex < source.length && charIndex < numberOfCharacters
+            && characterBounds(at: charIndex).contains(point) ? charIndex : nil
+        guard offset != nil || allowNearby,
+              let allText = textSelection(in: NSRange(location: 0, length: min(source.length, numberOfCharacters))) else { return nil }
+
+        let pageWidth = bounds(for: .cropBox).width
+        let lines: [PDFTextLine] = allText.selectionsByLine().flatMap { line in
+            let bounds = line.bounds(for: self)
+            return (0..<line.numberOfTextRanges(on: self)).flatMap { index -> [PDFTextLine] in
+                let range = line.range(at: index, on: self)
+                guard range.location < source.length, range.length > 0, range.length <= source.length - range.location else { return [] }
+                let parts = bounds.width > pageWidth * 0.53
+                    ? splitSentenceLine(range, in: source, gap: max(bounds.height * 1.8, pageWidth * 0.035)) : [range]
+                return parts.compactMap { part in
+                    let rect = part == range && line.numberOfTextRanges(on: self) == 1 ? bounds : textSelection(in: part)?.bounds(for: self)
+                    guard let rect, !rect.isEmpty else { return nil }
+                    return PDFTextLine(range: part, text: source.substring(with: part), bounds: rect)
+                }
+            }
+        }
+        let hit = offset.flatMap { offset in lines.first { NSLocationInRange(offset, $0.range) } }
+            ?? (allowNearby ? nearestTextLine(to: point, in: lines) : nil)
+        guard let hit, let column = hit.bounds else { return nil }
+        let nearby = lines.filter { line in
+            guard let rect = line.bounds else { return false }
+            let overlap = min(rect.maxX, column.maxX) - max(rect.minX, column.minX)
+            return overlap > min(rect.width, column.width) * 0.5 && abs(rect.minX - column.minX) <= column.height * 3
+                && (0.65...1.55).contains(rect.height / column.height)
+        }.sorted { ($0.bounds?.midY ?? 0) > ($1.bounds?.midY ?? 0) }
+        guard let index = nearby.firstIndex(where: { $0.range == hit.range }) else { return nil }
+
+        func consecutive(_ upper: PDFTextLine, _ lower: PDFTextLine) -> Bool {
+            guard let first = upper.bounds, let second = lower.bounds else { return false }
+            let height = max(first.height, second.height)
+            let step = (first.midY - second.midY) / height
+            guard (0.54...1.88).contains(step), min(first.height, second.height) >= height * 0.72 else { return false }
+            if first.width < second.width * 0.7 && first.height > second.height * 1.12 { return false }
+            if lower.text.hasPrefix("  ") || lower.text.hasPrefix("　") { return false }
+            if wholeParagraph {
+                if Self.startsBlock(lower.text) { return false }
+                if let last = upper.text.trimmingCharacters(in: .whitespacesAndNewlines).last,
+                   ".。!?！？”.）»".contains(last),
+                   first.maxX + height * 2.6 < second.maxX || abs(second.minX - first.minX) > height * 0.8 { return false }
+            }
+            let gapStart = NSMaxRange(upper.range)
+            if lower.range.location > gapStart {
+                let gap = source.substring(with: NSRange(location: gapStart, length: lower.range.location - gapStart))
+                if gap.allSatisfy(\.isWhitespace) && gap.filter(\.isNewline).count > 1 { return false }
+            }
+            return true
+        }
+
+        var start = index
+        var end = index
+        while start > 0, consecutive(nearby[start - 1], nearby[start]) { start -= 1 }
+        while end + 1 < nearby.count, consecutive(nearby[end], nearby[end + 1]) { end += 1 }
+        var text = ""
+        var spans: [(local: NSRange, original: NSRange)] = []
+        var position = 0
+        for line in nearby[start...end] {
+            if !text.isEmpty { text += "\n" }
+            let local = NSRange(location: text.utf16.count, length: line.range.length)
+            if line.range == hit.range, let offset { position = local.location + offset - hit.range.location }
+            spans.append((local: local, original: line.range))
+            text += line.text
+        }
+        let range = wholeParagraph ? NSRange(location: 0, length: text.utf16.count) :
+            ReadingSentence.ranges(in: text).first(where: { NSLocationInRange(position, $0) })
+        guard let range else { return nil }
+        let raw = (text as NSString).substring(with: range)
+        guard raw.contains(where: \.isLetter) else { return nil }
+        let selections = spans.compactMap { span -> PDFSelection? in
+            let part = NSIntersectionRange(span.local, range)
+            guard part.length > 0 else { return nil }
+            return textSelection(in: NSRange(location: span.original.location + part.location - span.local.location, length: part.length))
+        }
+        guard !selections.isEmpty else { return nil }
+        return PDFSentenceHit(page: self, text: ReadingSentence.translationText(raw), selections: selections,
+                              suspectedEncodingError: PDFQuoteQuality.isSuspicious(raw))
+    }
+
+    private func nearestTextLine(to point: CGPoint, in lines: [PDFTextLine]) -> PDFTextLine? {
+        lines.compactMap { line -> (PDFTextLine, CGFloat)? in
+            guard let rect = line.bounds, rect.insetBy(dx: -min(25, rect.height * 1.8), dy: -rect.height * 0.65).contains(point),
+                  line.text.contains(where: \.isLetter) else { return nil }
+            let dx = max(rect.minX - point.x, point.x - rect.maxX, 0)
+            return (line, abs(rect.midY - point.y) + dx)
+        }.min { $0.1 < $1.1 }?.0
+    }
+
+    private static let blockStart = try! NSRegularExpression(
+        pattern: #"^\s*(?:(?:Figure|Fig\.?|Table|图|表)\s*\d{1,4}[:：.\s]|\d{1,3}(?:\.\d{1,3}){1,4}\.?\s+(?=\p{L})|(?:[A-Z][A-Za-z-]*\s*){1,5}[:：])"#
+    )
+
+    private static func startsBlock(_ text: String) -> Bool {
+        blockStart.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+            || PDFOutlineInference.kind(of: text.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+    }
+
+    private func splitSentenceLine(_ range: NSRange, in source: NSString, gap: CGFloat) -> [NSRange] {
+        var parts: [NSRange] = []
+        var start = range.location
+        var previous: (offset: Int, rect: CGRect)?
+        for index in range.location..<NSMaxRange(range) {
+            if let character = Unicode.Scalar(source.character(at: index)), CharacterSet.whitespacesAndNewlines.contains(character) { continue }
+            let rect = characterBounds(at: index)
+            guard !rect.isEmpty else { continue }
+            if let previous, rect.minX - previous.rect.maxX > gap {
+                parts.append(NSRange(location: start, length: previous.offset + 1 - start))
+                start = index
+            }
+            previous = (index, rect)
+        }
+        parts.append(NSRange(location: start, length: NSMaxRange(range) - start))
+        return parts
     }
 }
 
@@ -119,6 +277,11 @@ extension PDFReader {
     }
 
     func printedPageLabel(at index: Int) -> String? {
+        guard let label = publicationPageLabel(at: index), label != String(index + 1) else { return nil }
+        return label
+    }
+
+    func publicationPageLabel(at index: Int) -> String? {
         if let cached = printedPageLabels[index] { return cached.isEmpty ? nil : cached }
         let filePage = String(index + 1)
         let embedded = sourcePage(at: index)?.label?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -126,8 +289,7 @@ extension PDFReader {
         if let embedded, !embedded.isEmpty, embedded != filePage {
             label = embedded
         } else if let footer = academicLayout(at: index)?.footer,
-                  [-1, 1].contains(where: { academicLayout(at: index + $0)?.footer?.number == footer.number + $0 }),
-                  String(footer.number) != filePage {
+                  [-1, 1].contains(where: { academicLayout(at: index + $0)?.footer?.number == footer.number + $0 }) {
             label = String(footer.number)
         } else {
             label = nil
@@ -144,7 +306,7 @@ extension PDFReader {
     func chapters(unit: PDFFoldUnit, groupSize: Int, inferred: [PDFReadingSection] = []) -> [PDFChapter] {
         let total = document.pageCount
         guard total > 0 else { return [] }
-        let outline = hasAuthorOutline ? sections : (savedOutline.isEmpty ? inferred : savedOutline)
+        let outline = (navigationSections.isEmpty ? inferred : navigationSections)
             .filter { (0..<total).contains($0.location.page) }
         if unit != .chapter || outline.isEmpty {
             let step = unit == .page ? 1 : max(2, min(groupSize, 20))
@@ -155,7 +317,7 @@ extension PDFReader {
                                   end: PDFReadingLocation(page: end), depth: 0)
             }
         }
-        let locations = hasAuthorOutline ? outline.map(headingLocation) : outline.map(\.location)
+        let locations = outline.map(sectionLocation)
         var result = outline.enumerated().map { index, section in
             let start = locations[index]
             let next = outline.indices.dropFirst(index + 1).first {
@@ -163,7 +325,7 @@ extension PDFReader {
             }
             return PDFChapter(id: section.id, title: section.title, start: start, end: next.map { locations[$0] }, depth: section.depth)
         }
-        if let first = result.first, first.start.page > 0 || (!hasAuthorOutline && hasOpeningText(before: first.start)) {
+        if let first = result.first, first.start.page > 0 || hasOpeningText(before: first.start) {
             result.insert(PDFChapter(id: -1, title: "卷首", start: PDFReadingLocation(page: 0), end: first.start, depth: 0), at: 0)
         }
         return result
@@ -184,6 +346,27 @@ extension PDFReader {
     func chapterAt(_ location: PDFReadingLocation, in chapters: [PDFChapter]) -> PDFChapter? {
         chapters.last { !isBefore(location, $0.start) }
             ?? chapters.first { $0.start.page == location.page } ?? chapters.first
+    }
+
+    func currentSectionID(in sections: [PDFReadingSection]) -> Int? {
+        sections.last(where: { !isBefore(location, $0.location) })?.id
+    }
+
+    func foldPosition(at location: PDFReadingLocation) -> PDFFoldPosition {
+        guard let point = location.point, let page = sourcePage(at: location.page),
+              let text = page.string else { return PDFFoldPosition(page: location.page) }
+        let layout = academicLayout(at: location.page)
+        let band = layout?.band(at: point)
+        let lines = layout?.lines ?? PDFTextLine.lines(in: text, on: page)
+        var best: (offset: Int, distance: CGFloat)?
+        for line in lines where !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard layout?.notes.contains(line.range.location) != true,
+                  let rect = line.bounds ?? page.textSelection(in: line.range)?.bounds(for: page), !rect.isEmpty,
+                  layout?.band(at: CGPoint(x: rect.midX, y: rect.midY)) == band else { continue }
+            let distance = abs(rect.maxY - point.y)
+            if best.map({ distance < $0.distance }) ?? true { best = (line.range.location, distance) }
+        }
+        return PDFFoldPosition(page: location.page, offset: best?.offset)
     }
 
     func foldedPage(_ index: Int, in chapter: PDFChapter) -> PDFFoldedPage {
@@ -315,16 +498,30 @@ extension PDFReader {
     }
 
     func stitchFoldedPages(_ previous: inout PDFFoldedPage, _ next: inout PDFFoldedPage) {
-        guard next.id == previous.id + 1, let tail = previous.passages.last, let head = next.passages.first,
-              let from = academicLayout(at: previous.id), let to = academicLayout(at: next.id),
-              let tailRange = tail.sources(startingOn: previous.id).last?.range,
-              let end = from.lines.last(where: { NSLocationInRange($0.range.location, tailRange) }),
+        guard let tail = previous.passages.last, let head = next.passages.first,
+              let tailSource = tail.sources(startingOn: previous.id).last, tailSource.page + 1 == next.id,
+              let from = academicLayout(at: tailSource.page), let to = academicLayout(at: next.id),
+              let end = from.lines.last(where: { NSLocationInRange($0.range.location, tailSource.range) }),
               let start = to.lines.first(where: { $0.range.location == head.id }),
               PDFOutlineInference.kind(of: start.text.precomposedStringWithCompatibilityMapping
                 .trimmingCharacters(in: .whitespacesAndNewlines)) == nil,
               from.continuesOnto(to, after: end, before: start) else { return }
         previous.passages[previous.passages.count - 1] = tail.appending(head, on: next.id)
         next.passages.removeFirst()
+    }
+
+    func stitchedFoldPages(_ pages: [PDFFoldedPage]) -> [PDFFoldedPage] {
+        var result = pages
+        var lastText: Int?
+        for index in result.indices {
+            if let lastText {
+                var previous = result[lastText]
+                stitchFoldedPages(&previous, &result[index])
+                result[lastText] = previous
+            }
+            if !result[index].passages.isEmpty { lastText = index }
+        }
+        return result
     }
 
     func splitChoices(for passage: FoldedPDFPassage, page: Int) -> [PDFSplitChoice] {
@@ -404,7 +601,8 @@ extension PDFReader {
         return result
     }
 
-    private func headingLocation(_ section: PDFReadingSection) -> PDFReadingLocation {
+    func sectionLocation(_ section: PDFReadingSection) -> PDFReadingLocation {
+        guard (hasAuthorOutline && savedOutline.isEmpty) || section.location.point == nil else { return section.location }
         guard let page = sourcePage(at: section.location.page), let text = page.string else { return section.location }
         let ns = text as NSString
         let title = section.title.trimmingCharacters(in: .whitespacesAndNewlines)

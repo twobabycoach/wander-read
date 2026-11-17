@@ -10,6 +10,9 @@ struct TextExcerpt: Codable, Equatable, Identifiable {
     let place: String
     var note = ""
     var createdAt: Date?
+    var markAppearance: ReadingMarkAppearance?
+
+    var appearance: ReadingMarkAppearance { markAppearance ?? ReadingMarkAppearance() }
 }
 
 struct TextReadingState: Codable, Equatable {
@@ -207,11 +210,14 @@ final class TextReader: ObservableObject {
     @Published var isFocused = false
     @Published private(set) var excerpts: [TextExcerpt]
     @Published var selection = NSRange(location: 0, length: 0)
+    @Published var selectionAnchor: CGRect?
     @Published var revealed: UUID?
     @Published var editing: UUID?
     @Published var draft = ""
+    @Published private(set) var pendingExcerpt: TextExcerpt?
     var offset: Int
     var move: ((Int) -> Void)?
+    var clearSelection: (() -> Void)?
     private var previous: [[TextExcerpt]] = []
     weak var store: ReadingStore?
 
@@ -229,18 +235,51 @@ final class TextReader: ObservableObject {
     var canUndo: Bool { !previous.isEmpty }
     var selectedQuote: String? { document.quote(selection) }
 
-    @discardableResult func capture(at range: NSRange? = nil, addingNote note: String = "") -> TextExcerpt? {
-        let range = range ?? selection
+    private func excerpt(at range: NSRange) -> TextExcerpt? {
         guard let quote = document.quote(range) else { return nil }
         if let existing = excerpts.last(where: { $0.revision == document.revision && $0.range == range }) {
-            guard !note.isEmpty, !existing.note.contains(note) else { return existing }
-            let combined = [existing.note, note].filter { !$0.isEmpty }.joined(separator: "\n\n")
-            guard annotate(existing.id, note: combined) else { return nil }
-            return excerpts.first { $0.id == existing.id }
+            return existing
         }
-        let excerpt = TextExcerpt(revision: document.revision, range: range, quote: quote,
-                                  place: document.place(at: range.location), note: note, createdAt: Date())
-        return save(excerpts + [excerpt]) ? excerpt : nil
+        return TextExcerpt(revision: document.revision, range: range, quote: quote,
+                           place: document.place(at: range.location), createdAt: Date(),
+                           markAppearance: store?.library.preferences.readingMarkAppearance)
+    }
+
+    @discardableResult func capture(at range: NSRange? = nil, addingNote note: String = "",
+                                    appearance: ReadingMarkAppearance? = nil) -> TextExcerpt? {
+        guard var excerpt = excerpt(at: range ?? selection) else { return nil }
+        if !note.isEmpty && !excerpt.note.contains(note) {
+            excerpt.note = [excerpt.note, note].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        }
+        if let appearance { excerpt.markAppearance = appearance }
+        return saveExcerpt(excerpt, remembering: appearance) ? excerpt : nil
+    }
+
+    func startAnnotation() -> TextExcerpt? {
+        guard let excerpt = excerpt(at: selection) else { return nil }
+        if !excerpts.contains(where: { $0.id == excerpt.id }) { pendingExcerpt = excerpt }
+        editing = excerpt.id
+        draft = excerpt.note
+        return excerpt
+    }
+
+    func discardDraft() {
+        editing = nil
+        pendingExcerpt = nil
+        draft = ""
+    }
+
+    func setAppearance(_ appearance: ReadingMarkAppearance, for id: UUID) {
+        guard var excerpt = excerpts.first(where: { $0.id == id }), excerpt.appearance != appearance else { return }
+        excerpt.markAppearance = appearance
+        _ = saveExcerpt(excerpt)
+    }
+
+    private func saveExcerpt(_ excerpt: TextExcerpt, remembering appearance: ReadingMarkAppearance? = nil) -> Bool {
+        var next = excerpts
+        if let index = next.firstIndex(where: { $0.id == excerpt.id }) { next[index] = excerpt }
+        else { next.append(excerpt) }
+        return save(next, remembering: appearance)
     }
 
     @discardableResult func annotate(_ id: UUID, note: String) -> Bool {
@@ -251,10 +290,14 @@ final class TextReader: ObservableObject {
     }
 
     @discardableResult func saveDraft() -> Bool {
-        if let editing {
+        guard let editing else { return true }
+        if var pending = pendingExcerpt {
+            pending.note = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard saveExcerpt(pending) else { return false }
+        } else {
             guard annotate(editing, note: draft) else { return false }
-            self.editing = nil
         }
+        discardDraft()
         return true
     }
 
@@ -271,17 +314,24 @@ final class TextReader: ObservableObject {
         previous.removeLast()
     }
 
-    private func save(_ next: [TextExcerpt]) -> Bool {
-        guard persist(next) else { return false }
+    private func save(_ next: [TextExcerpt], remembering appearance: ReadingMarkAppearance? = nil) -> Bool {
+        let changed = excerpts != next
+        if !changed && (appearance == nil || store?.library.preferences.readingMarkAppearance == appearance) { return true }
+        guard persist(next, remembering: appearance) else { return false }
+        guard changed else { return true }
         previous.append(excerpts)
         if previous.count > 12 { previous.removeFirst() }
         excerpts = next
         return true
     }
 
-    @discardableResult func persist(_ next: [TextExcerpt]? = nil) -> Bool {
+    @discardableResult func persist(_ next: [TextExcerpt]? = nil, remembering appearance: ReadingMarkAppearance? = nil) -> Bool {
         let state = TextReadingState(revision: document.revision, offset: offset, updatedAt: Date(), excerpts: next ?? excerpts)
-        return store?.mutate(itemID) { $0.textReading = state } ?? false
+        guard let store, let index = store.library.items.firstIndex(where: { $0.id == itemID && $0.trashedAt == nil }) else { return false }
+        return store.commit { library in
+            library.items[index].textReading = state
+            if let appearance { library.preferences.readingMarkAppearance = appearance }
+        }
     }
 
     func sourceOffset(_ excerpt: TextExcerpt) -> Int? {

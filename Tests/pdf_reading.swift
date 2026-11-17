@@ -2,8 +2,8 @@ import AppKit
 import CoreText
 import PDFKit
 
-func writeReadingPDF(_ url: URL, suffix: String = "") throws {
-    var bounds = CGRect(x: 0, y: 0, width: 600, height: 800)
+func writeReadingPDF(_ url: URL, suffix: String = "", pageWidth: CGFloat = 600) throws {
+    var bounds = CGRect(x: 0, y: 0, width: pageWidth, height: 800)
     guard let context = CGContext(url as CFURL, mediaBox: &bounds, nil) else {
         throw InputError.invalid("无法生成 PDF 测试文件。")
     }
@@ -43,6 +43,14 @@ func runPDFReadingChecks() throws {
     canvas.setCurrentSelection(passage, animate: false)
     let annotation = try reader.draft(kind: .annotation)
     check(annotation.location.page == 1 && !annotation.lines.isEmpty && annotation.quote == "Research evidence", "由 PDFKit 的原文选区取得页码、选中文字和页内几何")
+    let comparison = PDFDocument(url: file)!
+    let comparisonSelection = comparison.page(at: 1)!.selection(for: NSRange(location: 0, length: 17))!
+    let comparisonMark = try reader.draft(kind: .annotation, selection: comparisonSelection, in: comparison)
+    check(comparisonMark.quote == annotation.quote && comparisonMark.lines == annotation.lines &&
+          comparisonMark.location.page == 1,
+          "独立对照窗口的原文可保存相同页码、文字与高亮位置")
+    rejects({ _ = try reader.draft(kind: .annotation, selection: comparisonSelection, in: reader.document) },
+            "摘录拒绝不属于原文 PDF 的选区")
     check(reader.save(annotation) && reader.marks.first?.lines == annotation.lines, "保存 PDF 原文选区坐标")
     reader.remove(annotation.id)
     reader.undo()
@@ -51,6 +59,13 @@ func runPDFReadingChecks() throws {
     check(reader.marks.first?.color == .blue, "已有划线可换色")
     reader.undo()
     check(reader.marks.first?.color == nil, "划线换色可撤销")
+    let preset = ReadingMarkAppearance(color: .pink, style: .underline)
+    let upgraded = try reader.excerpt(appearance: preset)
+    check(upgraded?.id == annotation.id && reader.marks.count == 1 && reader.marks.first?.appearance == preset &&
+          store.library.preferences.readingMarkAppearance == preset, "同一选区摘录复用已有划线，并记住选择的标记样式")
+    check(try reader.draft(kind: .annotation).id == annotation.id, "同一选区追加批注时复用原摘录")
+    reader.undo()
+    check(reader.marks == [annotation], "撤销转换与换色后恢复原标记及原有 ID")
     var second = annotation
     second.id = UUID()
     second.note = "批量清除用的第二条"

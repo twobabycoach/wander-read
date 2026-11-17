@@ -104,13 +104,32 @@ func runPDFOutlineBuilderChecks() throws {
           "左侧印刷页码与折行的目录标题能对上正文完整标题")
     let store = ReadingStore(directory: root.appendingPathComponent("Library"), refreshOnLoad: false)
     let item = ReadingItem(title: "印刷目录样本", target: pdf.path)
+    let revision = try PDFReader.fingerprint(pdf)
     check(store.commit { $0.items = [item] }, "建立目录测试资料")
-    let reader = PDFReader(item: item, url: pdf, revision: "fixture", document: doc, store: store)
+    let cache = PDFDetectedOutline(revision: revision, entries: candidates)
+    check(store.updatePDFReading(item.id) { $0.detectedOutline = cache }, "保存在本机识别的目录")
+    let reader = PDFReader(item: store.library.items[0], url: pdf, revision: revision, document: doc, store: store)
+    reader.prepareOutline()
+    check(!reader.findingOutline && reader.navigationSections.count == 4 &&
+          reader.outlineForEditing == candidates && reader.pendingOutlineCount == 1,
+          "同一版本打开后直接使用识别缓存，导航和编辑共用结果")
+    let location = candidates[2].location!
+    let folded = reader.foldPosition(at: location)
+    let headingRange = (doc.page(at: location.page)!.string! as NSString).range(of: "第一节")
+    check(folded.offset == headingRange.location, "同一 PDF 页的原页位置能对回折叠中的真实行")
+    reader.showOutline = true
+    reader.jumpInFold(to: location, position: folded)
+    check(reader.toggleBookmark(title: candidates[2].title) && reader.bookmarkHere?.foldPosition == folded &&
+          reader.renameBookmark(reader.bookmarks[0].id, title: "查材料来源"),
+          "折叠中的书签带原页和段落锚点，可在目录旁重命名")
+    let options = PDFFoldOptions(unit: .group, pages: 5, fullPassages: true)
+    check(reader.setFoldOptions(options) && reader.flushPosition(force: true) &&
+          store.library.preferences.pdfFoldUnit == nil, "折叠方式、展开深度与续读位置按文档保存")
     check(!reader.saveOutline(candidates) && reader.savedOutline.isEmpty, "待核对的位置不能直接保存")
     check(reader.saveOutline(candidates, resolvedOnly: true) && reader.savedOutline.count == 4,
           "仅保存已定位的章节，待核对位置不用于导航")
     let draftStore = ReadingStore(directory: root.appendingPathComponent("Library"), refreshOnLoad: false)
-    let draftReader = PDFReader(item: draftStore.library.items.first!, url: pdf, revision: "fixture", document: doc, store: draftStore)
+    let draftReader = PDFReader(item: draftStore.library.items.first!, url: pdf, revision: revision, document: doc, store: draftStore)
     check(draftReader.outlineDraft == candidates && draftReader.savedOutline.count == 4,
           "确认项和待核对条目在重开后均可接续")
     var confirmed = candidates
@@ -119,11 +138,15 @@ func runPDFOutlineBuilderChecks() throws {
           "核对后可保存并用于章节折叠")
     let reopened = ReadingStore(directory: root.appendingPathComponent("Library"), refreshOnLoad: false)
     let savedItem = reopened.library.items.first!
-    let same = PDFReader(item: savedItem, url: pdf, revision: "fixture", document: doc, store: reopened)
+    let same = PDFReader(item: savedItem, url: pdf, revision: revision, document: doc, store: reopened)
     let revised = PDFReader(item: savedItem, url: pdf, revision: "changed", document: doc, store: reopened)
     let after = try Data(contentsOf: pdf)
     check(same.savedOutline == reader.savedOutline && same.outlineDraft == nil && revised.savedOutline.isEmpty && after == original,
           "目录跨重开保留，旧版本位置不复用，原文件保持一致")
+    check(same.foldOptions == options && same.foldPosition == folded && same.bookmarkHere?.title == "查材料来源" &&
+          revised.detectedOutline == nil && revised.bookmarkHere == nil && revised.bookmarks.count == 1,
+          "重开保留书签与折叠状态，文件更新后停用旧坐标")
+    check(same.toggleBookmark(title: "") && same.bookmarks.isEmpty, "同一位置的快捷键再次按下移除书签")
     let scanned = root.appendingPathComponent("扫描目录.pdf")
     try writeImageOnlyOutlineFixture(from: doc, to: scanned)
     let imagePDF = PDFDocument(url: scanned)!
